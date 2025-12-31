@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Large data files (don't push to GitHub)
+data/training/tiles/*.npy
+data/live_imagery/
+*.tif
+*.tiff
+*.geotiff
+
+# Model checkpoints (large files - use Git LFS or external storage)
+checkpoints/*.pth
+
+# Training logs
+training_log*.txt
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+*.env
+
+# Temporary files
+*.tmp
+*.temp

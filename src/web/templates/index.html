@@ -1,0 +1,263 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mauritius Land Cover Analysis</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        .legend-color {
+            width: 20px;
+            height: 20px;
+            display: inline-block;
+            margin-right: 8px;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen">
+    <nav class="bg-green-700 text-white p-4">
+        <div class="container mx-auto">
+            <h1 class="text-2xl font-bold">🇲🇺 Mauritius Land Cover Analysis</h1>
+            <p class="text-green-200">PhD Research - Sentinel-2 Satellite Imagery Analysis</p>
+        </div>
+    </nav>
+
+    <main class="container mx-auto p-6">
+        <!-- Tabs -->
+        <div class="flex space-x-4 mb-6">
+            <button onclick="showTab('classification')" class="tab-btn bg-green-600 text-white px-4 py-2 rounded">
+                Classification
+            </button>
+            <button onclick="showTab('change')" class="tab-btn bg-gray-300 px-4 py-2 rounded">
+                Change Detection
+            </button>
+            <button onclick="showTab('timeseries')" class="tab-btn bg-gray-300 px-4 py-2 rounded">
+                Time Series
+            </button>
+        </div>
+
+        <!-- Classification Tab -->
+        <div id="classification-tab" class="tab-content">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <!-- Input Panel -->
+                <div class="bg-white rounded-lg shadow p-6">
+                    <h2 class="text-xl font-semibold mb-4">Input</h2>
+                    <button onclick="loadDemo()" class="bg-green-600 text-white px-4 py-2 rounded mb-4">
+                        Load Demo Data
+                    </button>
+                    <div id="input-preview" class="border rounded p-4 min-h-64 flex items-center justify-center">
+                        <p class="text-gray-400">Click "Load Demo Data" to start</p>
+                    </div>
+                </div>
+
+                <!-- Output Panel -->
+                <div class="bg-white rounded-lg shadow p-6">
+                    <h2 class="text-xl font-semibold mb-4">Classification Result</h2>
+                    <div id="output-preview" class="border rounded p-4 min-h-64 flex items-center justify-center">
+                        <p class="text-gray-400">Results will appear here</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Legend -->
+            <div class="bg-white rounded-lg shadow p-6 mt-6">
+                <h2 class="text-xl font-semibold mb-4">Legend</h2>
+                <div class="flex flex-wrap gap-4">
+                    <div><span class="legend-color" style="background: #808080"></span>Roads</div>
+                    <div><span class="legend-color" style="background: #0064FF"></span>Water</div>
+                    <div><span class="legend-color" style="background: #006400"></span>Forest</div>
+                    <div><span class="legend-color" style="background: #32CD32"></span>Plantation</div>
+                    <div><span class="legend-color" style="background: #8B4513"></span>Buildings</div>
+                    <div><span class="legend-color" style="background: #D2B48C"></span>Bare Land</div>
+                </div>
+            </div>
+
+            <!-- Statistics -->
+            <div class="bg-white rounded-lg shadow p-6 mt-6">
+                <h2 class="text-xl font-semibold mb-4">Statistics</h2>
+                <div id="statistics-table"></div>
+            </div>
+        </div>
+
+        <!-- Change Detection Tab -->
+        <div id="change-tab" class="tab-content hidden">
+            <div class="bg-white rounded-lg shadow p-6">
+                <h2 class="text-xl font-semibold mb-4">Change Detection</h2>
+                <div class="flex space-x-4 mb-4">
+                    <select id="year1" class="border rounded px-3 py-2">
+                        <option value="2015">2015</option>
+                        <option value="2017">2017</option>
+                        <option value="2019">2019</option>
+                    </select>
+                    <span class="self-center">to</span>
+                    <select id="year2" class="border rounded px-3 py-2">
+                        <option value="2021">2021</option>
+                        <option value="2023">2023</option>
+                        <option value="2024" selected>2024</option>
+                    </select>
+                    <button onclick="runChangeDetection()" class="bg-green-600 text-white px-4 py-2 rounded">
+                        Analyze Changes
+                    </button>
+                </div>
+                <div class="grid grid-cols-3 gap-4" id="change-results">
+                    <div class="text-center">
+                        <p class="font-semibold mb-2">Before</p>
+                        <div id="before-image" class="border rounded p-2 min-h-48"></div>
+                    </div>
+                    <div class="text-center">
+                        <p class="font-semibold mb-2">After</p>
+                        <div id="after-image" class="border rounded p-2 min-h-48"></div>
+                    </div>
+                    <div class="text-center">
+                        <p class="font-semibold mb-2">Changes (Red)</p>
+                        <div id="change-image" class="border rounded p-2 min-h-48"></div>
+                    </div>
+                </div>
+                <div id="change-stats" class="mt-4"></div>
+            </div>
+        </div>
+
+        <!-- Time Series Tab -->
+        <div id="timeseries-tab" class="tab-content hidden">
+            <div class="bg-white rounded-lg shadow p-6">
+                <h2 class="text-xl font-semibold mb-4">Land Cover Change Over Time</h2>
+                <canvas id="timeSeriesChart" height="100"></canvas>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        // Tab switching
+        function showTab(tabName) {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
+            document.querySelectorAll('.tab-btn').forEach(el => {
+                el.classList.remove('bg-green-600', 'text-white');
+                el.classList.add('bg-gray-300');
+            });
+            
+            document.getElementById(tabName + '-tab').classList.remove('hidden');
+            event.target.classList.add('bg-green-600', 'text-white');
+            event.target.classList.remove('bg-gray-300');
+            
+            if (tabName === 'timeseries') {
+                loadTimeSeries();
+            }
+        }
+
+        // Load demo data
+        async function loadDemo() {
+            const response = await fetch('/api/demo');
+            const data = await response.json();
+            
+            document.getElementById('output-preview').innerHTML = 
+                `<img src="data:image/png;base64,${data.prediction}" class="max-w-full" alt="Classification">`;
+            
+            // Display statistics
+            let tableHtml = '<table class="w-full"><thead><tr class="bg-gray-100">' +
+                '<th class="p-2 text-left">Class</th><th class="p-2">Area (ha)</th><th class="p-2">%</th></tr></thead><tbody>';
+            
+            for (const [className, stats] of Object.entries(data.statistics)) {
+                if (className !== 'Background') {
+                    tableHtml += `<tr><td class="p-2">${className}</td>` +
+                        `<td class="p-2 text-center">${stats.area_hectares}</td>` +
+                        `<td class="p-2 text-center">${stats.percentage}%</td></tr>`;
+                }
+            }
+            tableHtml += '</tbody></table>';
+            document.getElementById('statistics-table').innerHTML = tableHtml;
+        }
+
+        // Change detection
+        async function runChangeDetection() {
+            const year1 = document.getElementById('year1').value;
+            const year2 = document.getElementById('year2').value;
+            
+            const response = await fetch('/api/change_detection', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({year1: parseInt(year1), year2: parseInt(year2)})
+            });
+            const data = await response.json();
+            
+            document.getElementById('before-image').innerHTML = 
+                `<img src="data:image/png;base64,${data.year1.image}" class="max-w-full">`;
+            document.getElementById('after-image').innerHTML = 
+                `<img src="data:image/png;base64,${data.year2.image}" class="max-w-full">`;
+            document.getElementById('change-image').innerHTML = 
+                `<img src="data:image/png;base64,${data.change_map}" class="max-w-full">`;
+            
+            // Display change statistics
+            let statsHtml = '<h3 class="font-semibold mb-2">Change Statistics</h3><table class="w-full">' +
+                '<thead><tr class="bg-gray-100"><th class="p-2">Class</th><th class="p-2">Before</th>' +
+                '<th class="p-2">After</th><th class="p-2">Change</th></tr></thead><tbody>';
+            
+            for (const [className, stats] of Object.entries(data.change_statistics)) {
+                const changeColor = stats.change_hectares > 0 ? 'text-green-600' : 'text-red-600';
+                statsHtml += `<tr><td class="p-2">${className}</td>` +
+                    `<td class="p-2 text-center">${stats.before_hectares} ha</td>` +
+                    `<td class="p-2 text-center">${stats.after_hectares} ha</td>` +
+                    `<td class="p-2 text-center ${changeColor}">${stats.change_hectares > 0 ? '+' : ''}${stats.change_hectares} ha</td></tr>`;
+            }
+            statsHtml += '</tbody></table>';
+            document.getElementById('change-stats').innerHTML = statsHtml;
+        }
+
+        // Load time series
+        async function loadTimeSeries() {
+            const response = await fetch('/api/time_series');
+            const data = await response.json();
+            
+            const ctx = document.getElementById('timeSeriesChart').getContext('2d');
+            
+            const colors = {
+                'Roads': '#808080',
+                'Water': '#0064FF',
+                'Forest': '#006400',
+                'Plantation': '#32CD32',
+                'Buildings': '#8B4513',
+                'Bare Land': '#D2B48C'
+            };
+            
+            const datasets = Object.entries(data.data)
+                .filter(([name]) => name !== 'Background')
+                .map(([name, values]) => ({
+                    label: name,
+                    data: values.map(v => v.area_hectares),
+                    borderColor: colors[name],
+                    backgroundColor: colors[name] + '40',
+                    fill: false,
+                    tension: 0.1
+                }));
+            
+            new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: data.years,
+                    datasets: datasets
+                },
+                options: {
+                    responsive: true,
+                    plugins: {
+                        title: {
+                            display: true,
+                            text: 'Land Cover Area Over Time (hectares)'
+                        }
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            title: {display: true, text: 'Area (hectares)'}
+                        },
+                        x: {
+                            title: {display: true, text: 'Year'}
+                        }
+                    }
+                }
+            });
+        }
+    </script>
+</body>
+</html>

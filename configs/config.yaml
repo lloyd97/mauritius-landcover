@@ -1,0 +1,187 @@
+# Mauritius Land Cover Classification Configuration
+# ================================================
+
+# Project Info
+project:
+  name: "Mauritius Land Cover Change Detection"
+  version: "1.0.0"
+  author: "PhD Research"
+
+# Area of Interest - Mauritius
+aoi:
+  name: "Mauritius"
+  bounds:
+    min_lon: 57.30
+    max_lon: 57.82
+    min_lat: -20.53
+    max_lat: -19.98
+  epsg: 32740  # UTM Zone 40S
+
+# Data Configuration
+data:
+  satellite: "sentinel-2"
+  product: "L2A"  # Surface reflectance
+  
+  # Bands to use
+  bands:
+    - "B2"   # Blue (10m)
+    - "B3"   # Green (10m)
+    - "B4"   # Red (10m)
+    - "B8"   # NIR (10m)
+    - "B11"  # SWIR1 (20m, resampled)
+    - "B12"  # SWIR2 (20m, resampled)
+  
+  # Derived indices
+  indices:
+    - "NDVI"   # Vegetation
+    - "NDWI"   # Water
+    - "NDBI"   # Built-up
+  
+  # Time periods for analysis
+  time_periods:
+    - name: "baseline"
+      start: "2015-06-01"
+      end: "2016-05-31"
+    - name: "mid_period"
+      start: "2019-06-01"
+      end: "2020-05-31"
+    - name: "current"
+      start: "2024-06-01"
+      end: "2025-05-31"
+  
+  # Cloud filtering
+  cloud_cover_max: 20  # percentage
+  
+  # Tiling
+  tile_size: 256
+  overlap: 32
+  
+  # Data split
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+
+# Class Definitions
+classes:
+  - id: 0
+    name: "background"
+    color: [0, 0, 0]
+    
+  - id: 1
+    name: "roads"
+    color: [128, 128, 128]
+    description: "Highways, streets, paths"
+    
+  - id: 2
+    name: "water"
+    color: [0, 100, 255]
+    description: "Rivers, lakes, ocean, reservoirs"
+    
+  - id: 3
+    name: "forest"
+    color: [0, 100, 0]
+    description: "Natural forests, dense vegetation"
+    
+  - id: 4
+    name: "plantation"
+    color: [50, 205, 50]
+    description: "Sugar cane, agriculture fields"
+    
+  - id: 5
+    name: "buildings"
+    color: [139, 69, 19]
+    description: "Urban areas, structures"
+    
+  - id: 6
+    name: "bare_land"
+    color: [210, 180, 140]
+    description: "Exposed soil, construction sites"
+
+# Model Configuration
+model:
+  # Architecture
+  architecture: "unet"  # Options: unet, unet_lstm, deeplabv3
+  encoder: "resnet50"
+  encoder_weights: "imagenet"
+  
+  # Input/Output
+  in_channels: 9  # 6 bands + 3 indices
+  num_classes: 7
+  
+  # For LSTM temporal model
+  lstm:
+    enabled: false
+    hidden_size: 64
+    num_layers: 2
+    sequence_length: 6  # Number of temporal images
+
+# Training Configuration
+training:
+  # Basic settings
+  epochs: 100
+  batch_size: 16
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  
+  # Learning rate scheduler
+  scheduler:
+    type: "cosine"
+    warmup_epochs: 5
+    min_lr: 0.000001
+  
+  # Loss function
+  loss:
+    type: "combined"  # ce + dice
+    ce_weight: 0.5
+    dice_weight: 0.5
+    class_weights: "auto"  # Compute from data
+  
+  # Early stopping
+  early_stopping:
+    patience: 15
+    min_delta: 0.001
+  
+  # Data augmentation
+  augmentation:
+    enabled: true
+    horizontal_flip: true
+    vertical_flip: true
+    rotation: 90
+    brightness: 0.2
+    contrast: 0.2
+
+# Inference Configuration
+inference:
+  batch_size: 32
+  tile_size: 256
+  overlap: 64  # Larger overlap for smooth boundaries
+  tta: true  # Test-time augmentation
+
+# Change Detection Configuration
+change_detection:
+  method: "post_classification"  # Options: post_classification, lstm, difference
+  min_change_area: 100  # Minimum change area in pixels
+  confidence_threshold: 0.7
+
+# Web Interface Configuration
+web:
+  host: "0.0.0.0"
+  port: 5000
+  debug: false
+  map_center: [-20.25, 57.55]  # Mauritius center
+  map_zoom: 10
+
+# Output Configuration
+output:
+  format: "geotiff"
+  crs: "EPSG:32740"
+  resolution: 10  # meters
+  colormap: "custom"  # Use class colors defined above
+
+# Logging
+logging:
+  level: "INFO"
+  tensorboard: true
+  wandb:
+    enabled: false
+    project: "mauritius-landcover"

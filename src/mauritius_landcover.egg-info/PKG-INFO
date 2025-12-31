@@ -1,0 +1,191 @@
+Metadata-Version: 2.4
+Name: mauritius-landcover
+Version: 1.0.0
+Summary: Land cover classification and change detection for Mauritius using Sentinel-2 imagery
+Home-page: https://github.com/yourusername/mauritius-landcover
+Author: PhD Research
+Author-email: your.email@university.edu
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Topic :: Scientific/Engineering :: GIS
+Classifier: Topic :: Scientific/Engineering :: Image Recognition
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.0.0
+Requires-Dist: torchvision>=0.15.0
+Requires-Dist: segmentation-models-pytorch>=0.3.3
+Requires-Dist: rasterio>=1.3.0
+Requires-Dist: geopandas>=0.13.0
+Requires-Dist: numpy>=1.24.0
+Requires-Dist: pandas>=2.0.0
+Requires-Dist: matplotlib>=3.7.0
+Requires-Dist: flask>=2.3.0
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: tqdm>=4.65.0
+Requires-Dist: albumentations>=1.3.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.3.0; extra == "dev"
+Requires-Dist: black>=23.3.0; extra == "dev"
+Requires-Dist: flake8>=6.0.0; extra == "dev"
+Provides-Extra: gee
+Requires-Dist: earthengine-api>=0.1.350; extra == "gee"
+Requires-Dist: geemap>=0.22.0; extra == "gee"
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: provides-extra
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
+# 🇲🇺 Mauritius Land Cover Change Detection System
+
+A deep learning-based system for analyzing land cover changes in Mauritius using Sentinel-2 satellite imagery (2015-2025).
+
+## 🎯 Project Overview
+
+This project provides:
+- **Semantic segmentation** of satellite imagery into land cover classes
+- **Temporal change detection** across multiple time periods
+- **Interactive web interface** for visualization
+- **Quantitative analysis** of land cover changes
+
+### Land Cover Classes
+
+| Class | Color | RGB | Description |
+|-------|-------|-----|-------------|
+| Roads | Grey | (128, 128, 128) | Highways, streets, paths |
+| Water | Blue | (0, 100, 255) | Rivers, lakes, ocean, reservoirs |
+| Forest | Dark Green | (0, 100, 0) | Natural forests, dense vegetation |
+| Plantation/Crops | Light Green | (50, 205, 50) | Sugar cane, agriculture fields |
+| Buildings | Brown | (139, 69, 19) | Urban areas, structures |
+| Bare Land | Tan | (210, 180, 140) | Exposed soil, construction |
+
+## 📁 Project Structure
+
+```
+mauritius-landcover/
+├── src/
+│   ├── data/              # Data acquisition & preprocessing
+│   │   ├── gee_download.py       # Google Earth Engine scripts
+│   │   ├── preprocessing.py       # Image preprocessing
+│   │   └── dataset.py            # PyTorch dataset classes
+│   ├── models/            # Deep learning models
+│   │   ├── unet.py               # U-Net architecture
+│   │   ├── lstm_unet.py          # U-Net + LSTM for temporal
+│   │   └── train.py              # Training pipeline
+│   ├── utils/             # Utilities
+│   │   ├── visualization.py      # Plotting & mapping
+│   │   ├── metrics.py            # Evaluation metrics
+│   │   └── change_detection.py   # Change analysis
+│   └── web/               # Web interface
+│       ├── app.py                # Flask/FastAPI backend
+│       ├── templates/            # HTML templates
+│       └── static/               # CSS, JS, assets
+├── notebooks/             # Jupyter notebooks for exploration
+├── configs/               # Configuration files
+├── data/                  # Data directory
+│   ├── raw/              # Raw satellite imagery
+│   ├── processed/        # Preprocessed tiles
+│   └── outputs/          # Model outputs & maps
+├── docs/                  # Documentation
+├── tests/                 # Unit tests
+└── requirements.txt       # Python dependencies
+```
+
+## 🚀 Quick Start
+
+### 1. Installation
+
+```bash
+# Clone repository
+git clone https://github.com/yourusername/mauritius-landcover.git
+cd mauritius-landcover
+
+# Create conda environment
+conda create -n landcover python=3.10
+conda activate landcover
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Install GDAL (recommended via conda)
+conda install -c conda-forge gdal rasterio
+```
+
+### 2. Data Acquisition
+
+```bash
+# Option A: Google Earth Engine (recommended)
+python src/data/gee_download.py --aoi mauritius --start 2015-01-01 --end 2025-01-01
+
+# Option B: Manual download from Copernicus
+# Visit: https://dataspace.copernicus.eu/
+```
+
+### 3. Training
+
+```bash
+# Train U-Net model
+python src/models/train.py --config configs/unet_config.yaml
+
+# Train LSTM model for temporal analysis
+python src/models/train.py --config configs/lstm_config.yaml
+```
+
+### 4. Inference & Visualization
+
+```bash
+# Generate land cover maps
+python src/inference.py --input data/raw/mauritius_2024.tif --output data/outputs/
+
+# Launch web interface
+python src/web/app.py
+```
+
+## 📊 Methodology
+
+### Data Pipeline
+1. **Acquisition**: Sentinel-2 L2A imagery from Copernicus/GEE
+2. **Preprocessing**: Cloud masking, atmospheric correction, band selection
+3. **Tiling**: 256×256 pixel patches with overlap
+4. **Augmentation**: Rotation, flip, color jittering
+
+### Model Architecture
+- **Base Model**: U-Net with ResNet50 encoder (pretrained on ImageNet)
+- **Temporal Model**: U-Net + ConvLSTM for multi-temporal analysis
+- **Training**: Binary Cross-Entropy + Dice Loss, Adam optimizer
+
+### Change Detection
+- **Bi-temporal**: Compare two dates directly
+- **Time-series**: LSTM-based continuous monitoring
+- **Post-classification**: Compare classified maps
+
+## 📈 Expected Outputs
+
+1. **Land Cover Maps**: GeoTIFF files with classification
+2. **Change Maps**: Highlighting areas of change
+3. **Statistics**: CSV/JSON with area calculations
+4. **Web Dashboard**: Interactive visualization
+
+## 📚 References
+
+1. Sefrin, O., Riese, F.M., Keller, S. (2021). Deep Learning for Land Cover Change Detection. Remote Sensing.
+2. Helber, P. et al. (2019). EuroSAT: A Novel Dataset for Land Use Classification.
+3. Ronneberger, O. et al. (2015). U-Net: Convolutional Networks for Biomedical Image Segmentation.
+
+## 📄 License
+
+MIT License - See LICENSE file
+
+## 👤 Author
+
+[Your Name] - PhD Research Project
+[Your University]
