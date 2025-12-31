@@ -1407,16 +1407,16 @@ def historical_comparison():
         return jsonify({'error': str(e)}), 500
 
 
+# Load model at module level (for gunicorn)
+print("=" * 60)
+print("Live Interactive Map - Mauritius Land Cover")
+print("=" * 60)
+load_model()
+print(f"\nUsing device: {DEVICE}")
+print(f"Google Earth Engine: {'Available' if GEE_AVAILABLE else 'Not available (using fallback)'}")
+
+
 if __name__ == '__main__':
-    print("=" * 60)
-    print("Live Interactive Map - Mauritius Land Cover")
-    print("=" * 60)
-
-    # Load model
-    load_model()
-
-    print(f"\nUsing device: {DEVICE}")
-    print(f"Google Earth Engine: {'Available' if GEE_AVAILABLE else 'Not available (using fallback)'}")
     print("\n" + "=" * 60)
     print("Starting web server...")
     print("Visit: http://localhost:5003")
