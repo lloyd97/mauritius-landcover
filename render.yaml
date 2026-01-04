@@ -3,7 +3,7 @@ services:
     name: mauritius-landcover
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn src.web.live_interactive_map:app --bind 0.0.0.0:$PORT --timeout 120 --workers 2
+    startCommand: gunicorn src.web.live_interactive_map:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1
     envVars:
       - key: PYTHON_VERSION
         value: "3.10.12"
