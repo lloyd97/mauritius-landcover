@@ -2,9 +2,14 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies for rasterio and GDAL
 RUN apt-get update && apt-get install -y \
     build-essential \
+    libexpat1 \
+    libgdal-dev \
+    gdal-bin \
+    libproj-dev \
+    proj-bin \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for caching
