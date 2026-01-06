@@ -1,3 +1,13 @@
+---
+title: Mauritius Land Cover Classification
+emoji: 🌍
+colorFrom: green
+colorTo: blue
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # Mauritius Land Cover Classification
 
 Deep learning-based land cover classification for Mauritius using Sentinel-2 satellite imagery and U-Net with ResNet50 encoder.
