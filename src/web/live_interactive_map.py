@@ -4,6 +4,7 @@ Fetches and classifies Sentinel-2/Landsat imagery in real-time as you pan the ma
 Supports historical imagery from 2010-present with change detection charts
 """
 
+import os
 import numpy as np
 import torch
 import torch.nn as nn
