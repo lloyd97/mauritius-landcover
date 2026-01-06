@@ -20,8 +20,8 @@ data/live_imagery/
 *.tiff
 *.geotiff
 
-# Model checkpoints (large files - use Git LFS or external storage)
-checkpoints/*.pth
+# Model checkpoints (tracked with Git LFS for HuggingFace)
+# checkpoints/*.pth
 
 # Training logs
 training_log*.txt
