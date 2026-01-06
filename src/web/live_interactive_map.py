@@ -77,22 +77,20 @@ try:
             credentials = ee.ServiceAccountCredentials(None, key_data=credentials_dict)
             ee.Initialize(credentials)
         else:
-            # OAuth refresh token - write to temp credentials file
-            import tempfile
-            credentials_path = os.path.join(tempfile.gettempdir(), 'ee_credentials.json')
+            # OAuth refresh token - write to EE's expected credentials location
+            ee_credentials_dir = os.path.expanduser('~/.config/earthengine')
+            os.makedirs(ee_credentials_dir, exist_ok=True)
+            credentials_path = os.path.join(ee_credentials_dir, 'credentials')
             with open(credentials_path, 'w') as f:
                 json.dump(credentials_dict, f)
+            print(f"Wrote credentials to {credentials_path}")
 
-            # Use google.oauth2 for refresh token auth
-            from google.oauth2.credentials import Credentials
-            credentials = Credentials(
-                token=None,
-                refresh_token=credentials_dict.get('refresh_token'),
-                token_uri='https://oauth2.googleapis.com/token',
-                client_id='517222506229-vsmmajv00ul0bs7p89v5m89ber09i6ko.apps.googleusercontent.com',
-                client_secret='RUP0RCmq1Zd5vqYGn5SgO7zh',
-            )
-            ee.Initialize(credentials, project=credentials_dict.get('project'))
+            # Initialize with project
+            project = credentials_dict.get('project')
+            if project:
+                ee.Initialize(project=project)
+            else:
+                ee.Initialize()
         print("SUCCESS: Google Earth Engine initialized from EARTHENGINE_TOKEN")
     else:
         ee.Initialize()
