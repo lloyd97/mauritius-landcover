@@ -66,9 +66,30 @@ CLASSES = {
 # Initialize Earth Engine
 GEE_AVAILABLE = False
 try:
-    ee.Initialize()
+    # Check for EARTHENGINE_TOKEN environment variable (for cloud deployment)
+    ee_token = os.environ.get('EARTHENGINE_TOKEN')
+    if ee_token:
+        import json
+        credentials_dict = json.loads(ee_token)
+        credentials = ee.ServiceAccountCredentials(None, key_data=credentials_dict) if 'private_key' in credentials_dict else None
+        if credentials:
+            ee.Initialize(credentials)
+        else:
+            # Use refresh token authentication
+            credentials = ee.oauth.Credentials(
+                token=None,
+                refresh_token=credentials_dict.get('refresh_token'),
+                token_uri='https://oauth2.googleapis.com/token',
+                client_id='517222506229-vsmmajv00ul0bs7p89v5m89ber09i6ko.apps.googleusercontent.com',
+                client_secret='RUP0RCmq1Zd5vqYGn5SgO7zh',
+                scopes=credentials_dict.get('scopes', [])
+            )
+            ee.Initialize(credentials, project=credentials_dict.get('project'))
+        print("SUCCESS: Google Earth Engine initialized from EARTHENGINE_TOKEN")
+    else:
+        ee.Initialize()
+        print("SUCCESS: Google Earth Engine initialized from local credentials")
     GEE_AVAILABLE = True
-    print("SUCCESS: Google Earth Engine initialized")
 except Exception as e:
     print(f"WARNING: GEE initialization failed: {e}")
 
