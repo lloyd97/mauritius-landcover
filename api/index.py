@@ -308,7 +308,7 @@ HTML_TEMPLATE = '''
 <body>
     <div id="header">
         <h1>Mauritius Land Cover Classification</h1>
-        <p>Interactive map with AI-powered land cover analysis</p>
+        <p>Interactive map with deep learning land cover analysis</p>
     </div>
 
     <div class="demo-banner">
