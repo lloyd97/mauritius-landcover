@@ -36,6 +36,9 @@ TIME_PERIODS = {
 # Store historical statistics for change detection charts
 HISTORICAL_STATS = {}
 
+# Cache for full island classification results
+MAURITIUS_CLASSIFICATION_CACHE = {}
+
 # Configuration
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 MODEL = None
@@ -865,19 +868,53 @@ HTML_TEMPLATE = '''
             width: 100%;
         }
 
+        #mauritius-map {
+            height: 100%;
+            width: 100%;
+            min-height: 200px;
+            background-color: #a8d8ea;  /* Light blue for ocean */
+        }
+
+        .dual-image-container {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            height: 100%;
+            width: 100%;
+        }
+
+        .image-wrapper {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+        }
+
+        .image-label {
+            text-align: center;
+            font-size: 11px;
+            font-weight: 600;
+            color: #666;
+            padding: 3px 0;
+            background: #f5f5f5;
+            border-radius: 4px 4px 0 0;
+        }
+
         .image-container {
             text-align: center;
-            height: 100%;
+            flex: 1;
             display: flex;
             align-items: center;
             justify-content: center;
+            background: #fafafa;
+            border-radius: 0 0 4px 4px;
         }
 
         .image-container img {
             max-width: 100%;
             max-height: 100%;
             border: 2px solid #e0e0e0;
-            border-radius: 8px;
+            border-radius: 4px;
         }
 
         .legend-item {
@@ -909,10 +946,33 @@ HTML_TEMPLATE = '''
             font-weight: 500;
         }
 
-        .legend-percentage {
+        .legend-percentage, .legend-value {
             font-weight: 700;
-            font-size: 16px;
+            font-size: 14px;
             color: #333;
+            min-width: 55px;
+            text-align: right;
+        }
+
+        .legend-bar-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .legend-bar-bg {
+            width: 100%;
+            height: 8px;
+            background: #e0e0e0;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .legend-bar {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.5s ease;
         }
 
         #loading-overlay {
@@ -1002,19 +1062,34 @@ HTML_TEMPLATE = '''
         </div>
 
         <div class="panel">
-            <div class="panel-header">🛰️ Sentinel-2 Satellite Image</div>
+            <div class="panel-header">🛰️ Satellite Image & Classification</div>
             <div class="panel-content">
-                <div class="image-container" id="satellite-container">
-                    <p style="color: #999;">Pan the map to load imagery</p>
+                <div class="dual-image-container">
+                    <div class="image-wrapper">
+                        <div class="image-label">Sentinel-2</div>
+                        <div class="image-container" id="satellite-container">
+                            <p style="color: #999;">Pan the map to load imagery</p>
+                        </div>
+                    </div>
+                    <div class="image-wrapper">
+                        <div class="image-label">Classification</div>
+                        <div class="image-container" id="classification-container">
+                            <p style="color: #999;">Classification will appear here</p>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
 
         <div class="panel">
-            <div class="panel-header">🗺️ Land Cover Classification</div>
-            <div class="panel-content">
-                <div class="image-container" id="classification-container">
-                    <p style="color: #999;">Classification will appear here</p>
+            <div class="panel-header">🗺️ Mauritius Classification</div>
+            <div class="panel-content" style="padding: 0; position: relative; height: calc(100% - 40px);">
+                <div id="mauritius-map"></div>
+                <div id="mauritius-loading" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); display: none; background: rgba(255,255,255,0.9); padding: 15px 25px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); z-index: 1000;">
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <div class="spinner" style="width: 20px; height: 20px; border: 3px solid #f3f3f3; border-top: 3px solid #4a7c24; border-radius: 50%; animation: spin 1s linear infinite;"></div>
+                        <span>Classifying Mauritius...</span>
+                    </div>
                 </div>
             </div>
         </div>
@@ -1076,6 +1151,109 @@ HTML_TEMPLATE = '''
             'Bare Land': 'rgba(239, 235, 233, 0.8)',
             'Background': 'rgba(245, 243, 240, 0.8)'
         };
+
+        // Initialize Mauritius overview map (no base map - classification only)
+        const mauritiusMap = L.map('mauritius-map', {
+            zoomControl: false,
+            attributionControl: false
+        }).setView([-20.25, 57.55], 10);
+
+        // Force map to recalculate size after DOM is ready
+        setTimeout(() => mauritiusMap.invalidateSize(), 100);
+
+        let mauritiusOverlay = null;
+        let currentMauritiusYear = null;
+
+        // Function to load full island classification
+        async function loadMauritiusClassification(year) {
+            if (currentMauritiusYear === year) return;
+
+            document.getElementById('mauritius-loading').style.display = 'block';
+
+            try {
+                const response = await fetch('/api/classify_mauritius', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ year: year })
+                });
+
+                const data = await response.json();
+
+                if (data.classification_image) {
+                    // Remove old overlay
+                    if (mauritiusOverlay) {
+                        mauritiusMap.removeLayer(mauritiusOverlay);
+                    }
+
+                    // Add new classification overlay
+                    const bounds = [
+                        [data.bounds.south, data.bounds.west],
+                        [data.bounds.north, data.bounds.east]
+                    ];
+
+                    mauritiusOverlay = L.imageOverlay(
+                        'data:image/png;base64,' + data.classification_image,
+                        bounds,
+                        { opacity: 1.0 }
+                    ).addTo(mauritiusMap);
+
+                    currentMauritiusYear = year;
+
+                    // Update Class Distribution panel with island-wide stats
+                    if (data.statistics) {
+                        updateIslandLegend(data.statistics, year);
+                    }
+
+                    // Store for historical comparison
+                    historicalData[year] = data.statistics;
+                }
+            } catch (error) {
+                console.error('Error loading Mauritius classification:', error);
+            }
+
+            document.getElementById('mauritius-loading').style.display = 'none';
+        }
+
+        // Function to update legend with island-wide statistics
+        function updateIslandLegend(statistics, year) {
+            const legendDiv = document.getElementById('legend');
+            const yearLabel = year === 'current' ? 'Current' : year;
+
+            // Filter out Background class and sort by percentage descending
+            const filteredStats = statistics
+                .filter(stat => stat.class !== 'Background')
+                .sort((a, b) => b.percentage - a.percentage);
+
+            let html = `<div style="font-size: 12px; color: #333; margin-bottom: 12px; text-align: center; font-weight: 600;">🏝️ Full Island Statistics</div>`;
+            html += `<div style="font-size: 10px; color: #888; margin-bottom: 15px; text-align: center;">${yearLabel} Classification</div>`;
+
+            filteredStats.forEach(stat => {
+                const color = classColors[stat.class] || 'rgba(200,200,200,0.8)';
+                const rgbColor = color.replace('0.8)', '1)');
+                const barColor = color.replace('rgba', 'rgb').replace(', 0.8)', ')');
+                html += `
+                    <div class="legend-item" style="flex-direction: column; align-items: stretch; padding: 8px 12px;">
+                        <div style="display: flex; align-items: center; margin-bottom: 6px;">
+                            <div class="legend-color" style="background: ${rgbColor}; width: 24px; height: 24px; margin-right: 10px;"></div>
+                            <div class="legend-text" style="flex: 1;">${stat.class}</div>
+                            <div class="legend-value">${stat.percentage.toFixed(1)}%</div>
+                        </div>
+                        <div class="legend-bar-bg">
+                            <div class="legend-bar" style="width: ${stat.percentage}%; background: ${barColor};"></div>
+                        </div>
+                    </div>
+                `;
+            });
+
+            // Add total area info
+            const totalLandPercentage = filteredStats.reduce((sum, s) => sum + s.percentage, 0);
+            html += `<div style="font-size: 10px; color: #999; margin-top: 15px; text-align: center; padding-top: 10px; border-top: 1px solid #eee;">Land coverage: ${totalLandPercentage.toFixed(1)}% of classified area</div>`;
+
+            legendDiv.innerHTML = html;
+        }
+
+        // Load initial classification
+        setTimeout(() => loadMauritiusClassification('current'), 1000);
 
         // Function to fetch and classify
         function fetchAndClassify(lat, lon, forceRefresh = false) {
@@ -1174,9 +1352,13 @@ HTML_TEMPLATE = '''
 
         // Year selector change handler
         document.getElementById('year-selector').addEventListener('change', function() {
+            const selectedYear = this.value;
+            // Update local tile classification
             if (lastFetchedLat !== null && lastFetchedLon !== null) {
                 fetchAndClassify(lastFetchedLat, lastFetchedLon, true);
             }
+            // Update full island classification
+            loadMauritiusClassification(selectedYear);
         });
 
         // Load historical comparison button handler
@@ -1425,6 +1607,210 @@ def historical_comparison():
         return jsonify({
             'statistics': all_statistics,
             'location': {'lat': lat, 'lon': lon}
+        })
+
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+# Directory for cached full-island classification images
+CLASSIFICATION_CACHE_DIR = Path('data/classification_cache')
+CLASSIFICATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Mauritius bounding box (constant)
+MAURITIUS_BOUNDS_FULL = {
+    'north': -19.98,
+    'south': -20.52,
+    'west': 57.30,
+    'east': 57.80
+}
+
+
+def get_cached_classification_path(year):
+    """Get file paths for cached classification data"""
+    return {
+        'image': CLASSIFICATION_CACHE_DIR / f'mauritius_{year}.png',
+        'stats': CLASSIFICATION_CACHE_DIR / f'mauritius_{year}_stats.json'
+    }
+
+
+def load_cached_classification(year):
+    """Load classification from disk if it exists"""
+    paths = get_cached_classification_path(year)
+
+    if paths['image'].exists() and paths['stats'].exists():
+        print(f"Loading cached classification for {year} from disk")
+
+        # Load image as base64
+        with open(paths['image'], 'rb') as f:
+            classification_b64 = base64.b64encode(f.read()).decode()
+
+        # Load statistics
+        with open(paths['stats'], 'r') as f:
+            stats_data = json.load(f)
+
+        return {
+            'classification_image': classification_b64,
+            'bounds': MAURITIUS_BOUNDS_FULL,
+            'statistics': stats_data['statistics'],
+            'year': year
+        }
+
+    return None
+
+
+def save_classification_to_cache(year, image_data, statistics):
+    """Save classification image and stats to disk"""
+    paths = get_cached_classification_path(year)
+
+    # Save image
+    image_bytes = base64.b64decode(image_data)
+    with open(paths['image'], 'wb') as f:
+        f.write(image_bytes)
+
+    # Save statistics
+    with open(paths['stats'], 'w') as f:
+        json.dump({'statistics': statistics, 'year': year}, f)
+
+    print(f"Saved classification for {year} to {paths['image']}")
+
+
+@app.route('/api/classify_mauritius', methods=['POST'])
+def classify_mauritius():
+    """
+    Classify the full island of Mauritius using hierarchical mosaic approach.
+
+    The key insight: each 256x256 tile represents exactly 2km x 2km.
+    We create a grid where each cell is 2km, download/classify each cell,
+    then assemble them in the correct geographic order.
+    """
+    try:
+        data = request.get_json()
+        year = data.get('year', 'current')
+
+        # Check disk cache first
+        cached = load_cached_classification(year)
+        if cached:
+            return jsonify(cached)
+
+        print(f"\n{'='*60}")
+        print(f"Full Mauritius classification for year: {year}")
+        print(f"Using mosaic approach (2km tiles)...")
+
+        bounds = MAURITIUS_BOUNDS_FULL
+
+        # Each 256x256 tile = 2km x 2km
+        # Convert 2km to degrees at Mauritius latitude (~-20.25)
+        km_per_deg_lat = 111.0
+        km_per_deg_lon = 111.0 * np.cos(np.radians(20.25))  # ~104 km/deg
+
+        tile_size_km = 2.0
+        tile_deg_lat = tile_size_km / km_per_deg_lat  # ~0.018 deg
+        tile_deg_lon = tile_size_km / km_per_deg_lon  # ~0.019 deg
+
+        # Calculate grid dimensions
+        lat_range = bounds['north'] - bounds['south']  # ~0.54 deg = ~60km
+        lon_range = bounds['east'] - bounds['west']    # ~0.50 deg = ~52km
+
+        # Use a fixed grid size - since we cache the result, processing time is okay
+        # 15x13 grid gives good coverage (~195 tiles, will take ~15-20 min first time)
+        n_rows = 15  # covers ~60km with ~4km per tile
+        n_cols = 13  # covers ~52km with ~4km per tile
+
+        # Calculate step size and tile size to match
+        step_lat = lat_range / n_rows
+        step_lon = lon_range / n_cols
+
+        # Each tile should cover exactly one grid cell
+        # Convert step degrees to km for download
+        tile_size_km_lat = step_lat * km_per_deg_lat  # ~4km
+        tile_size_km_lon = step_lon * km_per_deg_lon  # ~4km
+        tile_size_km = max(tile_size_km_lat, tile_size_km_lon)  # Use larger to ensure coverage
+
+        print(f"  Grid: {n_rows} rows x {n_cols} cols = {n_rows * n_cols} tiles")
+        print(f"  Step: {step_lat:.4f} deg lat, {step_lon:.4f} deg lon")
+        print(f"  Tile size: {tile_size_km:.1f} km (to cover each grid cell)")
+
+        # Create composite array
+        composite_h = 256 * n_rows
+        composite_w = 256 * n_cols
+        composite = np.zeros((composite_h, composite_w), dtype=np.uint8)
+
+        total_statistics = {}
+        valid_tiles = 0
+
+        # Process tiles: row 0 = southernmost, col 0 = westernmost
+        for row in range(n_rows):
+            for col in range(n_cols):
+                # Tile center coordinates
+                center_lat = bounds['south'] + (row + 0.5) * step_lat
+                center_lon = bounds['west'] + (col + 0.5) * step_lon
+
+                tile_num = row * n_cols + col + 1
+                print(f"  [{row},{col}] Tile {tile_num}/{n_rows*n_cols} at ({center_lat:.4f}, {center_lon:.4f})")
+
+                try:
+                    # Download and classify
+                    image_data = download_imagery_for_year(center_lat, center_lon, year, size_km=tile_size_km)
+                    prediction = classify_image(image_data['bands_data'])
+
+                    # Place in composite:
+                    # - row 0 (south) should be at BOTTOM of image (high y)
+                    # - col 0 (west) should be at LEFT of image (low x)
+                    y_start = (n_rows - 1 - row) * 256  # row 0 -> bottom
+                    x_start = col * 256
+
+                    composite[y_start:y_start+256, x_start:x_start+256] = prediction
+                    valid_tiles += 1
+
+                    # Accumulate statistics
+                    stats = get_class_statistics(prediction)
+                    for stat in stats:
+                        name = stat['name']
+                        if name not in total_statistics:
+                            total_statistics[name] = 0
+                        total_statistics[name] += stat['percentage']
+
+                except Exception as e:
+                    print(f"    Error: {e}")
+
+        # Average statistics
+        if valid_tiles > 0:
+            for name in total_statistics:
+                total_statistics[name] /= valid_tiles
+
+        # Create colored RGBA image
+        colored = np.zeros((composite_h, composite_w, 4), dtype=np.uint8)
+        for class_id, class_info in CLASSES.items():
+            mask = composite == class_id
+            colored[mask] = class_info['color'] + [255]
+
+        # Convert to PNG
+        img = Image.fromarray(colored, 'RGBA')
+        buffer = io.BytesIO()
+        img.save(buffer, format='PNG')
+        classification_b64 = base64.b64encode(buffer.getvalue()).decode()
+
+        # Format statistics
+        statistics = [
+            {'class': name, 'percentage': round(pct, 2)}
+            for name, pct in sorted(total_statistics.items(), key=lambda x: -x[1])
+        ]
+
+        # Save to cache
+        save_classification_to_cache(year, classification_b64, statistics)
+
+        print(f"Complete! {valid_tiles}/{n_rows*n_cols} tiles processed")
+        print(f"{'='*60}\n")
+
+        return jsonify({
+            'classification_image': classification_b64,
+            'bounds': bounds,
+            'statistics': statistics,
+            'year': year
         })
 
     except Exception as e:
