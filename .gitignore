@@ -20,8 +20,10 @@ data/live_imagery/
 *.tiff
 *.geotiff
 
-# Model checkpoints (tracked with Git LFS for HuggingFace)
-# checkpoints/*.pth
+# Model checkpoints (only enhanced_model.pth tracked with Git LFS)
+checkpoints/best_model.pth
+checkpoints/improved_model.pth
+checkpoints/enhanced_model_backup_73pct.pth
 
 # Training logs
 training_log*.txt
