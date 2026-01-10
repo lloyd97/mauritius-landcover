@@ -59,12 +59,13 @@ MAURITIUS_BOUNDS = {
 # Designed to match Apple Maps aesthetic: soft blues, natural greens, warm grays
 CLASSES = {
     0: {'name': 'Background', 'color': [245, 243, 240]},      # Warm off-white (Apple Maps background)
-    1: {'name': 'Water', 'color': [168, 216, 234]},           # Soft light blue (Apple Maps water)
+    1: {'name': 'Water', 'color': [168, 216, 234]},           # Soft light blue - inland water (lakes, rivers)
     2: {'name': 'Forest', 'color': [139, 195, 74]},           # Rich natural green (Apple Maps parks)
     3: {'name': 'Plantation', 'color': [197, 225, 165]},      # Light green (Apple Maps vegetation)
     4: {'name': 'Urban', 'color': [215, 204, 200]},           # Warm gray/tan (Apple Maps buildings)
     5: {'name': 'Roads', 'color': [158, 158, 158]},           # Medium gray (Apple Maps roads)
-    6: {'name': 'Bare Land', 'color': [239, 235, 233]}        # Sandy cream (Apple Maps bare areas)
+    6: {'name': 'Bare Land', 'color': [239, 235, 233]},       # Sandy cream (Apple Maps bare areas)
+    7: {'name': 'Ocean', 'color': [135, 190, 220]}            # Darker blue - ocean/sea water
 }
 
 # Initialize Earth Engine
@@ -101,6 +102,140 @@ try:
     GEE_AVAILABLE = True
 except Exception as e:
     print(f"WARNING: GEE initialization failed: {e}")
+
+
+# Mauritius land mask - cached at module level
+MAURITIUS_LAND_MASK = None
+
+def get_mauritius_land_mask():
+    """
+    Get a land mask for Mauritius using GEE's country boundaries.
+    Returns an ee.Image where land=1 and ocean=0.
+    """
+    global MAURITIUS_LAND_MASK
+
+    if MAURITIUS_LAND_MASK is not None:
+        return MAURITIUS_LAND_MASK
+
+    if not GEE_AVAILABLE:
+        return None
+
+    try:
+        # Use LSIB (Large Scale International Boundary) dataset for country boundaries
+        # Filter for Mauritius
+        countries = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+        mauritius = countries.filter(ee.Filter.eq('country_na', 'Mauritius'))
+
+        # Create a mask image: 1 inside Mauritius, 0 outside
+        MAURITIUS_LAND_MASK = ee.Image.constant(1).clip(mauritius).unmask(0)
+        print("SUCCESS: Loaded Mauritius land boundary mask")
+        return MAURITIUS_LAND_MASK
+    except Exception as e:
+        print(f"WARNING: Could not load Mauritius land mask: {e}")
+        return None
+
+
+def apply_ocean_mask_composite(composite, bounds):
+    """
+    Apply ocean mask to the full composite classification image.
+    Water pixels outside Mauritius land boundary become 'Ocean' (class 7).
+
+    Uses chunked processing to avoid GEE's sampleRectangle pixel limit (262144).
+
+    Args:
+        composite: numpy array of class predictions (full mosaic)
+        bounds: dict with north, south, east, west coordinates (full Mauritius bounds)
+
+    Returns:
+        Modified composite with ocean pixels marked as class 7
+    """
+    if not GEE_AVAILABLE:
+        print("    GEE not available, skipping ocean mask")
+        return composite
+
+    land_mask_ee = get_mauritius_land_mask()
+    if land_mask_ee is None:
+        print("    Land mask not available, skipping ocean mask")
+        return composite
+
+    try:
+        h, w = composite.shape
+        print(f"    Composite shape: {h}x{w} = {h*w} pixels")
+
+        # GEE limit is 262144 pixels per sampleRectangle call
+        # Process in chunks of 512x512 (262144 pixels)
+        chunk_size = 512
+        n_chunks_y = (h + chunk_size - 1) // chunk_size
+        n_chunks_x = (w + chunk_size - 1) // chunk_size
+
+        print(f"    Processing land mask in {n_chunks_y}x{n_chunks_x} = {n_chunks_y * n_chunks_x} chunks")
+
+        lat_range = bounds['north'] - bounds['south']
+        lon_range = bounds['east'] - bounds['west']
+
+        land_mask_np = np.zeros((h, w), dtype=np.uint8)
+
+        for cy in range(n_chunks_y):
+            for cx in range(n_chunks_x):
+                # Pixel coordinates for this chunk
+                y_start = cy * chunk_size
+                y_end = min((cy + 1) * chunk_size, h)
+                x_start = cx * chunk_size
+                x_end = min((cx + 1) * chunk_size, w)
+
+                chunk_h = y_end - y_start
+                chunk_w = x_end - x_start
+
+                # Geographic bounds for this chunk
+                # Note: y=0 is top (north), y=h is bottom (south)
+                chunk_north = bounds['north'] - (y_start / h) * lat_range
+                chunk_south = bounds['north'] - (y_end / h) * lat_range
+                chunk_west = bounds['west'] + (x_start / w) * lon_range
+                chunk_east = bounds['west'] + (x_end / w) * lon_range
+
+                try:
+                    region = ee.Geometry.Rectangle([chunk_west, chunk_south, chunk_east, chunk_north])
+
+                    # Scale to match chunk resolution
+                    scale = (chunk_north - chunk_south) * 111000 / chunk_h
+
+                    chunk_mask = land_mask_ee.reproject(crs='EPSG:4326', scale=scale).sampleRectangle(
+                        region=region,
+                        defaultValue=0
+                    ).get('constant').getInfo()
+
+                    chunk_mask = np.array(chunk_mask)
+
+                    # Resize if needed
+                    if chunk_mask.shape != (chunk_h, chunk_w):
+                        chunk_pil = Image.fromarray(chunk_mask.astype(np.uint8))
+                        chunk_pil = chunk_pil.resize((chunk_w, chunk_h), Image.NEAREST)
+                        chunk_mask = np.array(chunk_pil)
+
+                    land_mask_np[y_start:y_end, x_start:x_end] = chunk_mask
+
+                except Exception as chunk_e:
+                    print(f"      Chunk [{cy},{cx}] error: {chunk_e}")
+                    # Leave as 0 (ocean) if can't get mask
+
+        # Mark water pixels outside land as Ocean (class 7)
+        water_mask = composite == 1  # Water pixels
+        ocean_mask = water_mask & (land_mask_np == 0)  # Water outside land boundary
+
+        ocean_count = np.sum(ocean_mask)
+        water_remaining = np.sum(water_mask) - ocean_count
+        print(f"    Ocean pixels: {ocean_count}, Inland water pixels: {water_remaining}")
+
+        composite_masked = composite.copy()
+        composite_masked[ocean_mask] = 7  # Mark as Ocean
+
+        return composite_masked
+
+    except Exception as e:
+        print(f"    Warning: Could not apply ocean mask: {e}")
+        import traceback
+        traceback.print_exc()
+        return composite
 
 
 def load_model():
@@ -1149,7 +1284,8 @@ HTML_TEMPLATE = '''
             'Urban': 'rgba(215, 204, 200, 0.8)',
             'Roads': 'rgba(158, 158, 158, 0.8)',
             'Bare Land': 'rgba(239, 235, 233, 0.8)',
-            'Background': 'rgba(245, 243, 240, 0.8)'
+            'Background': 'rgba(245, 243, 240, 0.8)',
+            'Ocean': 'rgba(135, 190, 220, 0.8)'
         };
 
         // Initialize Mauritius overview map (no base map - classification only)
@@ -1219,15 +1355,22 @@ HTML_TEMPLATE = '''
             const legendDiv = document.getElementById('legend');
             const yearLabel = year === 'current' ? 'Current' : year;
 
-            // Filter out Background class and sort by percentage descending
-            const filteredStats = statistics
-                .filter(stat => stat.class !== 'Background')
+            // Filter out Background, Water, and Ocean (show land classes only), sort by percentage descending
+            const landStats = statistics
+                .filter(stat => stat.class !== 'Background' && stat.class !== 'Water' && stat.class !== 'Ocean')
                 .sort((a, b) => b.percentage - a.percentage);
 
-            let html = `<div style="font-size: 12px; color: #333; margin-bottom: 12px; text-align: center; font-weight: 600;">🏝️ Full Island Statistics</div>`;
+            // Recalculate percentages to sum to 100% (land only)
+            const totalLandRaw = landStats.reduce((sum, s) => sum + s.percentage, 0);
+            const normalizedStats = landStats.map(stat => ({
+                ...stat,
+                normalizedPercentage: (stat.percentage / totalLandRaw) * 100
+            }));
+
+            let html = `<div style="font-size: 12px; color: #333; margin-bottom: 12px; text-align: center; font-weight: 600;">🏝️ Mauritius Land Cover</div>`;
             html += `<div style="font-size: 10px; color: #888; margin-bottom: 15px; text-align: center;">${yearLabel} Classification</div>`;
 
-            filteredStats.forEach(stat => {
+            normalizedStats.forEach(stat => {
                 const color = classColors[stat.class] || 'rgba(200,200,200,0.8)';
                 const rgbColor = color.replace('0.8)', '1)');
                 const barColor = color.replace('rgba', 'rgb').replace(', 0.8)', ')');
@@ -1236,18 +1379,14 @@ HTML_TEMPLATE = '''
                         <div style="display: flex; align-items: center; margin-bottom: 6px;">
                             <div class="legend-color" style="background: ${rgbColor}; width: 24px; height: 24px; margin-right: 10px;"></div>
                             <div class="legend-text" style="flex: 1;">${stat.class}</div>
-                            <div class="legend-value">${stat.percentage.toFixed(1)}%</div>
+                            <div class="legend-value">${stat.normalizedPercentage.toFixed(1)}%</div>
                         </div>
                         <div class="legend-bar-bg">
-                            <div class="legend-bar" style="width: ${stat.percentage}%; background: ${barColor};"></div>
+                            <div class="legend-bar" style="width: ${stat.normalizedPercentage}%; background: ${barColor};"></div>
                         </div>
                     </div>
                 `;
             });
-
-            // Add total area info
-            const totalLandPercentage = filteredStats.reduce((sum, s) => sum + s.percentage, 0);
-            html += `<div style="font-size: 10px; color: #999; margin-top: 15px; text-align: center; padding-top: 10px; border-top: 1px solid #eee;">Land coverage: ${totalLandPercentage.toFixed(1)}% of classified area</div>`;
 
             legendDiv.innerHTML = html;
         }
@@ -1319,20 +1458,7 @@ HTML_TEMPLATE = '''
                 document.getElementById('classification-container').innerHTML =
                     '<img src="data:image/png;base64,' + data.classification + '" alt="Classification">';
 
-                // Update statistics
-                let legendHtml = '';
-                data.statistics.forEach(stat => {
-                    legendHtml += `
-                        <div class="legend-item">
-                            <div class="legend-color" style="background: rgb(${stat.color.join(',')})"></div>
-                            <div class="legend-text">${stat.name}</div>
-                            <div class="legend-percentage">${stat.percentage}%</div>
-                        </div>
-                    `;
-                });
-                document.getElementById('legend').innerHTML = legendHtml;
-
-                // Store statistics for historical comparison
+                // Store statistics for historical comparison (don't update legend - keep island-wide stats)
                 historicalData[selectedYear] = data.statistics;
 
                 // Update status
@@ -1777,10 +1903,17 @@ def classify_mauritius():
                 except Exception as e:
                     print(f"    Error: {e}")
 
-        # Average statistics
-        if valid_tiles > 0:
-            for name in total_statistics:
-                total_statistics[name] /= valid_tiles
+        # Apply ocean mask to the entire composite
+        print("  Applying ocean mask to separate inland water from ocean...")
+        composite = apply_ocean_mask_composite(composite, bounds)
+
+        # Recalculate statistics after ocean masking
+        total_pixels = composite.size
+        total_statistics = {}
+        for class_id, class_info in CLASSES.items():
+            count = np.sum(composite == class_id)
+            if count > 0:
+                total_statistics[class_info['name']] = (count / total_pixels) * 100
 
         # Create colored RGBA image
         colored = np.zeros((composite_h, composite_w, 4), dtype=np.uint8)
