@@ -828,13 +828,18 @@ HTML_TEMPLATE = '''
 <html>
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Live Interactive Map - Mauritius Land Cover</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; overflow: hidden; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            overflow-x: auto;
+            overflow-y: auto;
+        }
 
         #header {
             background: linear-gradient(135deg, #2d5016 0%, #4a7c24 100%);
@@ -921,8 +926,9 @@ HTML_TEMPLATE = '''
         #container {
             display: grid;
             grid-template-columns: 320px 1fr 1fr 280px 320px;
-            height: calc(100vh - 120px);
+            min-height: calc(100vh - 120px);
             gap: 0;
+            overflow-x: auto;
         }
 
         #change-chart-container {
@@ -978,10 +984,16 @@ HTML_TEMPLATE = '''
             border-right: 1px solid #e0e0e0;
             display: flex;
             flex-direction: column;
+            min-width: 180px;
         }
 
         .panel:last-child {
             border-right: none;
+        }
+
+        .panel:nth-child(2),
+        .panel:nth-child(3) {
+            min-width: 250px;
         }
 
         .panel-header {
@@ -1155,6 +1167,241 @@ HTML_TEMPLATE = '''
         .loading-subtext {
             font-size: 14px;
             color: #666;
+        }
+
+        /* Responsive Design */
+        @media (max-width: 1600px) {
+            #container {
+                grid-template-columns: 250px 1fr 1fr 220px 280px;
+            }
+        }
+
+        @media (max-width: 1400px) {
+            #container {
+                grid-template-columns: 220px 1fr 1fr 200px 250px;
+            }
+
+            .panel-header {
+                padding: 12px 15px;
+                font-size: 14px;
+            }
+        }
+
+        @media (max-width: 1200px) {
+            #container {
+                grid-template-columns: 180px 1fr 1fr 180px 220px;
+            }
+
+            #header h1 {
+                font-size: 20px;
+            }
+
+            #info-bar {
+                padding: 8px 15px;
+                gap: 15px;
+            }
+
+            .legend-item {
+                margin: 6px 0;
+                padding: 6px 8px;
+            }
+
+            .legend-color {
+                width: 24px;
+                height: 24px;
+                margin-right: 10px;
+            }
+
+            .legend-text {
+                font-size: 12px;
+            }
+
+            .legend-percentage {
+                font-size: 12px;
+            }
+        }
+
+        @media (max-width: 1024px) {
+            #container {
+                grid-template-columns: 1fr 1fr;
+                grid-template-rows: auto auto auto auto;
+                height: auto;
+                min-height: calc(100vh - 120px);
+            }
+
+            .panel {
+                border-right: none;
+                border-bottom: 1px solid #e0e0e0;
+            }
+
+            .panel:nth-child(1) { /* Satellite panel */
+                order: 3;
+                grid-column: 1;
+                min-height: 300px;
+            }
+
+            .panel:nth-child(2) { /* Map panel */
+                order: 1;
+                grid-column: 1 / -1;
+                min-height: 350px;
+            }
+
+            .panel:nth-child(3) { /* Mauritius Map panel */
+                order: 2;
+                grid-column: 1 / -1;
+                min-height: 300px;
+            }
+
+            .panel:nth-child(4) { /* Legend panel */
+                order: 4;
+                grid-column: 2;
+                min-height: 300px;
+            }
+
+            .panel:nth-child(5) { /* Historical panel */
+                order: 5;
+                grid-column: 1 / -1;
+            }
+
+            #header h1 {
+                font-size: 18px;
+            }
+
+            #info-bar {
+                flex-wrap: wrap;
+                gap: 10px;
+                padding: 10px 15px;
+            }
+        }
+
+        @media (max-width: 768px) {
+            #container {
+                grid-template-columns: 1fr;
+            }
+
+            .panel:nth-child(1),
+            .panel:nth-child(4),
+            .panel:nth-child(5) {
+                grid-column: 1;
+            }
+
+            .panel:nth-child(2) {
+                min-height: 300px;
+            }
+
+            .panel:nth-child(3) {
+                min-height: 280px;
+            }
+
+            #header {
+                padding: 12px 15px;
+            }
+
+            #header h1 {
+                font-size: 16px;
+                line-height: 1.3;
+            }
+
+            #header p {
+                font-size: 11px;
+            }
+
+            #info-bar {
+                flex-direction: column;
+                align-items: stretch;
+                gap: 8px;
+            }
+
+            .year-selector-container {
+                justify-content: space-between;
+            }
+
+            #year-selector {
+                min-width: 150px;
+            }
+
+            #status {
+                text-align: center;
+            }
+
+            .panel-header {
+                padding: 10px 12px;
+                font-size: 13px;
+            }
+
+            .panel-content {
+                padding: 10px;
+            }
+
+            .legend-item {
+                margin: 6px 0;
+                padding: 6px 8px;
+            }
+
+            .legend-color {
+                width: 20px;
+                height: 20px;
+                margin-right: 8px;
+            }
+
+            .legend-text {
+                font-size: 11px;
+            }
+
+            .legend-percentage {
+                font-size: 11px;
+                min-width: 40px;
+            }
+
+            .loading-content {
+                padding: 25px 30px;
+                margin: 15px;
+            }
+
+            .spinner {
+                width: 40px;
+                height: 40px;
+            }
+
+            .loading-text {
+                font-size: 16px;
+            }
+        }
+
+        @media (max-width: 480px) {
+            #header h1 {
+                font-size: 14px;
+            }
+
+            #header p {
+                font-size: 10px;
+            }
+
+            .panel:nth-child(2) {
+                min-height: 250px;
+            }
+
+            .panel:nth-child(3) {
+                min-height: 220px;
+            }
+
+            #year-selector {
+                min-width: 120px;
+                padding: 6px 10px;
+                font-size: 13px;
+            }
+
+            .year-selector-container label {
+                font-size: 12px;
+            }
+
+            .dual-image-container {
+                gap: 5px;
+            }
+
+            .image-label {
+                font-size: 10px;
+            }
         }
     </style>
 </head>
