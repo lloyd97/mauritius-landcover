@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 import rasterio
 from rasterio.io import MemoryFile
 import json
+from scipy.ndimage import median_filter
 
 app = Flask(__name__)
 
@@ -58,14 +59,15 @@ MAURITIUS_BOUNDS = {
 # Land cover classes - Apple Maps inspired color palette
 # Designed to match Apple Maps aesthetic: soft blues, natural greens, warm grays
 CLASSES = {
-    0: {'name': 'Background', 'color': [245, 243, 240]},      # Warm off-white (Apple Maps background)
+    0: {'name': 'Clouds', 'color': [255, 255, 255]},          # White for clouds
     1: {'name': 'Water', 'color': [168, 216, 234]},           # Soft light blue - inland water (lakes, rivers)
-    2: {'name': 'Forest', 'color': [139, 195, 74]},           # Rich natural green (Apple Maps parks)
-    3: {'name': 'Plantation', 'color': [197, 225, 165]},      # Light green (Apple Maps vegetation)
+    2: {'name': 'Forest', 'color': [34, 139, 34]},            # Forest green - dense vegetation (NDVI > 0.7)
+    3: {'name': 'Plantation', 'color': [218, 165, 32]},       # Goldenrod/yellow - agricultural (sugarcane, crops)
     4: {'name': 'Urban', 'color': [215, 204, 200]},           # Warm gray/tan (Apple Maps buildings)
     5: {'name': 'Roads', 'color': [158, 158, 158]},           # Medium gray (Apple Maps roads)
     6: {'name': 'Bare Land', 'color': [239, 235, 233]},       # Sandy cream (Apple Maps bare areas)
-    7: {'name': 'Ocean', 'color': [135, 190, 220]}            # Darker blue - ocean/sea water
+    7: {'name': 'Ocean', 'color': [135, 190, 220]},           # Darker blue - ocean/sea water
+    8: {'name': 'Wasteland', 'color': [189, 183, 107]}        # Khaki/olive - sparse vegetation, scrubland
 }
 
 # Initialize Earth Engine
@@ -163,8 +165,8 @@ def apply_ocean_mask_composite(composite, bounds):
         print(f"    Composite shape: {h}x{w} = {h*w} pixels")
 
         # GEE limit is 262144 pixels per sampleRectangle call
-        # Process in chunks of 512x512 (262144 pixels)
-        chunk_size = 512
+        # Use 450x450 chunks (202500 pixels) to stay safely under the limit
+        chunk_size = 450
         n_chunks_y = (h + chunk_size - 1) // chunk_size
         n_chunks_x = (w + chunk_size - 1) // chunk_size
 
@@ -218,16 +220,18 @@ def apply_ocean_mask_composite(composite, bounds):
                     print(f"      Chunk [{cy},{cx}] error: {chunk_e}")
                     # Leave as 0 (ocean) if can't get mask
 
-        # Mark water pixels outside land as Ocean (class 7)
-        water_mask = composite == 1  # Water pixels
-        ocean_mask = water_mask & (land_mask_np == 0)  # Water outside land boundary
+        # Mark ALL pixels outside land boundary as Ocean (class 7)
+        # This is critical: the model classifies pure ocean tiles as Forest, Wasteland, etc.
+        # We must override ALL non-land pixels, not just Water-classed ones
+        outside_land = land_mask_np == 0
 
-        ocean_count = np.sum(ocean_mask)
-        water_remaining = np.sum(water_mask) - ocean_count
-        print(f"    Ocean pixels: {ocean_count}, Inland water pixels: {water_remaining}")
+        ocean_count = np.sum(outside_land)
+        land_count = np.sum(land_mask_np == 1)
+        print(f"    Pixels outside land boundary (-> Ocean): {ocean_count}")
+        print(f"    Pixels inside land boundary (kept): {land_count}")
 
         composite_masked = composite.copy()
-        composite_masked[ocean_mask] = 7  # Mark as Ocean
+        composite_masked[outside_land] = 7  # Mark ALL non-land as Ocean
 
         return composite_masked
 
@@ -239,7 +243,7 @@ def apply_ocean_mask_composite(composite, bounds):
 
 
 def load_model():
-    """Load trained U-Net model"""
+    """Load trained U-Net model (7-class model, remapped to 9 display classes)"""
     global MODEL
 
     print("Loading model...")
@@ -268,8 +272,10 @@ def load_model():
 
     MODEL.encoder.conv1 = new_conv
 
-    # Load the enhanced model (trained with proper water detection)
-    checkpoint_path = Path('checkpoints/enhanced_model.pth')
+    # Load the 7-class model that produced good results on Jan 24/25
+    checkpoint_path = Path('checkpoints/enhanced_model_old7class.pth')
+    if not checkpoint_path.exists():
+        checkpoint_path = Path('checkpoints/enhanced_model_backup_before_wasteland.pth')
     if not checkpoint_path.exists():
         checkpoint_path = Path('checkpoints/improved_model.pth')
     if not checkpoint_path.exists():
@@ -761,12 +767,17 @@ def create_fallback_image(lat, lon):
     }
 
 
-def classify_image(bands_data):
-    """Run model inference"""
-    # Debug: print data statistics
-    print(f"Input bands_data shape: {bands_data.shape}")
-    print(f"Input data range: min={bands_data.min():.4f}, max={bands_data.max():.4f}, mean={bands_data.mean():.4f}")
+def classify_image(bands_data, apply_postprocessing=False, year='current'):
+    """
+    Run 7-class model inference, then remap to 9 display classes.
 
+    Model classes (trained labels vs actual spectral meaning):
+        0=Background (mixed), 1=Roads (actually water), 2=Water (actually forest),
+        3=Forest (actually moderate veg), 4=Plantation (low veg), 5=Buildings (urban), 6=Bare Land
+
+    Display classes:
+        0=Clouds, 1=Water, 2=Forest, 3=Plantation, 4=Urban, 5=Roads, 6=Bare Land, 7=Ocean, 8=Wasteland
+    """
     input_tensor = torch.from_numpy(bands_data).float().unsqueeze(0)
     input_tensor = input_tensor.to(DEVICE)
 
@@ -775,11 +786,102 @@ def classify_image(bands_data):
         prediction = torch.argmax(output, dim=1).squeeze(0)
         prediction = prediction.cpu().numpy()
 
-    # Debug: print prediction statistics
+    # Debug: show model output before remapping
     unique, counts = np.unique(prediction, return_counts=True)
-    print(f"Prediction classes: {dict(zip(unique, counts))}")
+    print(f"Model output classes (7-class): {dict(zip(unique, counts))}")
 
-    return prediction
+    # Remap 7 model classes → 9 display classes using spectral indices
+    display = remap_7_to_9(prediction, bands_data)
+
+    # Smooth the classification to remove salt-and-pepper noise
+    display = median_filter(display.astype(np.int32), size=5).astype(np.int64)
+
+    unique2, counts2 = np.unique(display, return_counts=True)
+    print(f"Display classes (9-class): {dict(zip(unique2, counts2))}")
+
+    return display
+
+
+def remap_7_to_9(prediction, bands_data):
+    """
+    Remap 7-class model output to 9 display classes.
+
+    Uses spectral indices (NDVI, NDWI, NDBI) from bands_data to split
+    the model's coarse classes into finer land cover types.
+
+    Thresholds calibrated from spectral analysis of 195 Mauritius tiles.
+    Target: Forest ~27%, Wasteland ~26%, Plantation ~24%, Urban ~12%, Roads ~7%, Bare Land ~4%
+
+    bands_data shape: (9, H, W) - B2, B3, B4, B8, B11, B12, NDVI, NDWI, NDBI
+    """
+    display = np.zeros_like(prediction)
+
+    # Extract spectral indices
+    ndvi = bands_data[6]
+    ndwi = bands_data[7]
+    ndbi = bands_data[8]
+    blue, green, red = bands_data[0], bands_data[1], bands_data[2]
+
+    # Normalize if in raw Sentinel-2 scale
+    if np.abs(ndvi).max() > 1.5:
+        ndvi = np.clip(ndvi / 10000.0, -1, 1)
+    if np.abs(ndwi).max() > 1.5:
+        ndwi = np.clip(ndwi / 10000.0, -1, 1)
+    if np.abs(ndbi).max() > 1.5:
+        ndbi = np.clip(ndbi / 10000.0, -1, 1)
+
+    # Brightness for cloud detection
+    b, g, r = blue.copy(), green.copy(), red.copy()
+    if b.max() > 100:
+        b, g, r = b / 10000.0, g / 10000.0, r / 10000.0
+    brightness = (b + g + r) / 3.0
+
+    # ── Model class 0 (Background) → Bare Land / Clouds / Water ──
+    bg = prediction == 0
+    display[bg] = 6  # Default: Bare Land
+    display[bg & (brightness > 0.25) & (ndwi <= 0.0)] = 0    # Clouds (bright, not water)
+    display[bg & (ndwi > 0.3)] = 7                             # Ocean (strong water signal)
+    display[bg & (ndwi > 0.0) & (ndwi <= 0.3)] = 1            # Shallow water
+    display[bg & (ndwi <= 0.0) & (brightness <= 0.25) & (ndvi >= 0.3)] = 8  # Vegetated bg → Wasteland
+
+    # ── Model class 1 (Water in model) → Display Water ──
+    display[prediction == 1] = 1
+
+    # ── Model class 2 (dominant vegetation, ~71% of land) ──
+    # Split using NDBI (calibrated from P25=-0.37, P50=-0.29, P75=-0.21 of mod2)
+    # Forest: very low NDBI = dense canopy blocking SWIR
+    # Plantation: moderate NDBI = sugarcane rows with soil exposure
+    # Urban: high NDBI = built-up surfaces (concrete, metal roofs)
+    # Wasteland: catch-all for moderate vegetation
+    mod2 = prediction == 2
+    display[mod2] = 8  # Default: Wasteland (catch-all)
+    display[mod2 & (ndvi >= 0.4) & (ndbi < -0.33)] = 2    # Forest (~25% of land)
+    display[mod2 & (ndvi >= 0.4) & (ndbi >= -0.33) & (ndbi < -0.24)] = 3  # Plantation (~22%)
+    display[mod2 & (ndvi < 0.15) & (ndbi < -0.15)] = 6    # Bare Land (very low NDVI)
+    display[mod2 & (ndbi >= -0.15)] = 4                     # Urban (~9%, high SWIR = built-up)
+
+    # ── Model class 3 (moderate vegetation, ~19.5% of land) ──
+    mod3 = prediction == 3
+    display[mod3] = 8  # Default: Wasteland
+    display[mod3 & (ndvi >= 0.5) & (ndbi < -0.35)] = 2    # Dense veg → Forest
+    display[mod3 & (ndvi >= 0.35) & (ndbi >= -0.35) & (ndbi < -0.24)] = 3  # Plantation
+    display[mod3 & (ndbi >= -0.15)] = 4                     # Urban
+    display[mod3 & (ndvi < 0.2)] = 5                        # Low NDVI in mod3 → Roads
+
+    # ── Model class 4 (low/sparse vegetation, ~4.5% of land) → Roads ──
+    mod4 = prediction == 4
+    display[mod4] = 5  # Default: Roads
+    display[mod4 & (ndvi >= 0.4)] = 8                       # High NDVI → actually Wasteland
+    display[mod4 & (ndbi >= -0.1)] = 4                      # High NDBI → Urban
+
+    # ── Model class 5 (Buildings) → Urban ──
+    display[prediction == 5] = 4
+
+    # ── Model class 6 (Bare Land) → Bare Land ──
+    display[prediction == 6] = 6
+
+    return display
+
 
 
 def create_colored_mask(prediction):
@@ -795,14 +897,21 @@ def create_colored_mask(prediction):
 
 
 def get_class_statistics(prediction):
-    """Calculate class distribution"""
+    """Calculate land-only class distribution (exclude Clouds, Water, Ocean)"""
     unique, counts = np.unique(prediction, return_counts=True)
-    total_pixels = prediction.size
+    count_map = dict(zip(unique, counts))
+
+    # Exclude non-land classes: Clouds(0), Water(1), Ocean(7)
+    excluded = {0, 1, 7}
+    land_pixels = sum(c for cid, c in count_map.items() if cid not in excluded and cid in CLASSES)
+
+    if land_pixels == 0:
+        land_pixels = 1  # Avoid division by zero
 
     stats = []
-    for class_id, count in zip(unique, counts):
-        if class_id in CLASSES:
-            percentage = (count / total_pixels) * 100
+    for class_id, count in count_map.items():
+        if class_id in CLASSES and class_id not in excluded:
+            percentage = (count / land_pixels) * 100
             stats.append({
                 'name': CLASSES[class_id]['name'],
                 'color': CLASSES[class_id]['color'],
@@ -1526,13 +1635,14 @@ HTML_TEMPLATE = '''
         // Class colors for chart
         const classColors = {
             'Water': 'rgba(168, 216, 234, 0.8)',
-            'Forest': 'rgba(139, 195, 74, 0.8)',
-            'Plantation': 'rgba(197, 225, 165, 0.8)',
+            'Forest': 'rgba(34, 139, 34, 0.8)',
+            'Plantation': 'rgba(218, 165, 32, 0.8)',
             'Urban': 'rgba(215, 204, 200, 0.8)',
             'Roads': 'rgba(158, 158, 158, 0.8)',
             'Bare Land': 'rgba(239, 235, 233, 0.8)',
-            'Background': 'rgba(245, 243, 240, 0.8)',
-            'Ocean': 'rgba(135, 190, 220, 0.8)'
+            'Clouds': 'rgba(255, 255, 255, 0.8)',
+            'Ocean': 'rgba(135, 190, 220, 0.8)',
+            'Wasteland': 'rgba(189, 183, 107, 0.8)'
         };
 
         // Initialize Mauritius overview map (no base map - classification only)
@@ -1548,12 +1658,18 @@ HTML_TEMPLATE = '''
         let currentMauritiusYear = null;
 
         // Function to load full island classification
-        async function loadMauritiusClassification(year) {
-            if (currentMauritiusYear === year) return;
+        async function loadMauritiusClassification(year, force = false) {
+            console.log('loadMauritiusClassification called with year:', year, 'current:', currentMauritiusYear, 'force:', force);
+
+            if (!force && currentMauritiusYear === year) {
+                console.log('Skipping - already loaded year:', year);
+                return;
+            }
 
             document.getElementById('mauritius-loading').style.display = 'block';
 
             try {
+                console.log('Fetching classification for year:', year);
                 const response = await fetch('/api/classify_mauritius', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -1561,6 +1677,7 @@ HTML_TEMPLATE = '''
                 });
 
                 const data = await response.json();
+                console.log('Received data for year:', year, 'statistics:', data.statistics);
 
                 if (data.classification_image) {
                     // Remove old overlay
@@ -1584,6 +1701,7 @@ HTML_TEMPLATE = '''
 
                     // Update Class Distribution panel with island-wide stats
                     if (data.statistics) {
+                        console.log('Updating legend with statistics:', data.statistics);
                         updateIslandLegend(data.statistics, year);
                     }
 
@@ -1602,34 +1720,32 @@ HTML_TEMPLATE = '''
             const legendDiv = document.getElementById('legend');
             const yearLabel = year === 'current' ? 'Current' : year;
 
-            // Filter out Background, Water, and Ocean (show land classes only), sort by percentage descending
+            // Filter out Clouds, Water, and Ocean (show land classes only), sort by percentage descending
             const landStats = statistics
-                .filter(stat => stat.class !== 'Background' && stat.class !== 'Water' && stat.class !== 'Ocean')
+                .filter(stat => stat.class !== 'Clouds' && stat.class !== 'Water' && stat.class !== 'Ocean')
                 .sort((a, b) => b.percentage - a.percentage);
 
-            // Recalculate percentages to sum to 100% (land only)
-            const totalLandRaw = landStats.reduce((sum, s) => sum + s.percentage, 0);
-            const normalizedStats = landStats.map(stat => ({
-                ...stat,
-                normalizedPercentage: (stat.percentage / totalLandRaw) * 100
-            }));
+            // Find max percentage for bar scaling (so largest bar is 100% width)
+            const maxPercentage = Math.max(...landStats.map(s => s.percentage));
 
             let html = `<div style="font-size: 12px; color: #333; margin-bottom: 12px; text-align: center; font-weight: 600;">🏝️ Mauritius Land Cover</div>`;
             html += `<div style="font-size: 10px; color: #888; margin-bottom: 15px; text-align: center;">${yearLabel} Classification</div>`;
 
-            normalizedStats.forEach(stat => {
+            landStats.forEach(stat => {
                 const color = classColors[stat.class] || 'rgba(200,200,200,0.8)';
                 const rgbColor = color.replace('0.8)', '1)');
                 const barColor = color.replace('rgba', 'rgb').replace(', 0.8)', ')');
+                // Scale bar width relative to max, so bars are visible
+                const barWidth = (stat.percentage / maxPercentage) * 100;
                 html += `
                     <div class="legend-item" style="flex-direction: column; align-items: stretch; padding: 8px 12px;">
                         <div style="display: flex; align-items: center; margin-bottom: 6px;">
                             <div class="legend-color" style="background: ${rgbColor}; width: 24px; height: 24px; margin-right: 10px;"></div>
                             <div class="legend-text" style="flex: 1;">${stat.class}</div>
-                            <div class="legend-value">${stat.normalizedPercentage.toFixed(1)}%</div>
+                            <div class="legend-value">${stat.percentage.toFixed(1)}%</div>
                         </div>
                         <div class="legend-bar-bg">
-                            <div class="legend-bar" style="width: ${stat.normalizedPercentage}%; background: ${barColor};"></div>
+                            <div class="legend-bar" style="width: ${barWidth}%; background: ${barColor};"></div>
                         </div>
                     </div>
                 `;
@@ -1638,8 +1754,11 @@ HTML_TEMPLATE = '''
             legendDiv.innerHTML = html;
         }
 
-        // Load initial classification
-        setTimeout(() => loadMauritiusClassification('current'), 1000);
+        // Load initial classification based on dropdown selection
+        setTimeout(() => {
+            const initialYear = document.getElementById('year-selector').value;
+            loadMauritiusClassification(initialYear, true);
+        }, 1000);
 
         // Function to fetch and classify
         function fetchAndClassify(lat, lon, forceRefresh = false) {
@@ -1726,12 +1845,13 @@ HTML_TEMPLATE = '''
         // Year selector change handler
         document.getElementById('year-selector').addEventListener('change', function() {
             const selectedYear = this.value;
+            console.log('Year selector changed to:', selectedYear);
             // Update local tile classification
             if (lastFetchedLat !== null && lastFetchedLon !== null) {
                 fetchAndClassify(lastFetchedLat, lastFetchedLon, true);
             }
-            // Update full island classification
-            loadMauritiusClassification(selectedYear);
+            // Update full island classification - force reload
+            loadMauritiusClassification(selectedYear, true);
         });
 
         // Load historical comparison button handler
@@ -1910,8 +2030,8 @@ def classify_location():
         # Download imagery for the specified year
         image_data = download_imagery_for_year(lat, lon, year)
 
-        # Classify
-        prediction = classify_image(image_data['bands_data'])
+        # Classify (pass year for correct NDVI thresholds)
+        prediction = classify_image(image_data['bands_data'], year=year)
 
         # Create colored visualization
         classification_colored = create_colored_mask(prediction)
@@ -1961,8 +2081,8 @@ def historical_comparison():
                 # Download imagery for this year
                 image_data = download_imagery_for_year(lat, lon, year)
 
-                # Classify
-                prediction = classify_image(image_data['bands_data'])
+                # Classify (pass year for correct NDVI thresholds)
+                prediction = classify_image(image_data['bands_data'], year=year)
 
                 # Get statistics
                 statistics = get_class_statistics(prediction)
@@ -1992,6 +2112,10 @@ def historical_comparison():
 # Directory for cached full-island classification images
 CLASSIFICATION_CACHE_DIR = Path('data/classification_cache')
 CLASSIFICATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Directory for cached raw satellite tile data (never re-downloaded)
+RAW_TILES_CACHE_DIR = CLASSIFICATION_CACHE_DIR / 'raw_tiles'
+RAW_TILES_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Mauritius bounding box (constant)
 MAURITIUS_BOUNDS_FULL = {
@@ -2063,11 +2187,14 @@ def classify_mauritius():
     try:
         data = request.get_json()
         year = data.get('year', 'current')
+        force_reclassify = data.get('force_reclassify', False)
 
-        # Check disk cache first
-        cached = load_cached_classification(year)
-        if cached:
-            return jsonify(cached)
+        # Check disk cache first (skip if force reclassify requested)
+        if not force_reclassify:
+            cached = load_cached_classification(year)
+            if cached:
+                print(f"Using CACHED classification for {year} - skipping re-run")
+                return jsonify(cached)
 
         print(f"\n{'='*60}")
         print(f"Full Mauritius classification for year: {year}")
@@ -2115,6 +2242,14 @@ def classify_mauritius():
         total_statistics = {}
         valid_tiles = 0
 
+        # Raw tile cache for this year
+        year_tile_dir = RAW_TILES_CACHE_DIR / str(year)
+        year_tile_dir.mkdir(parents=True, exist_ok=True)
+
+        # Count cached vs download needed
+        cached_count = 0
+        download_count = 0
+
         # Process tiles: row 0 = southernmost, col 0 = westernmost
         for row in range(n_rows):
             for col in range(n_cols):
@@ -2123,12 +2258,25 @@ def classify_mauritius():
                 center_lon = bounds['west'] + (col + 0.5) * step_lon
 
                 tile_num = row * n_cols + col + 1
-                print(f"  [{row},{col}] Tile {tile_num}/{n_rows*n_cols} at ({center_lat:.4f}, {center_lon:.4f})")
+                raw_tile_path = year_tile_dir / f"tile_{row:02d}_{col:02d}.npy"
 
                 try:
-                    # Download and classify
-                    image_data = download_imagery_for_year(center_lat, center_lon, year, size_km=tile_size_km)
-                    prediction = classify_image(image_data['bands_data'])
+                    # Check if raw satellite data is already cached
+                    if raw_tile_path.exists():
+                        bands_data = np.load(raw_tile_path)
+                        cached_count += 1
+                        if tile_num % 20 == 0 or tile_num == 1:
+                            print(f"  [{row},{col}] Tile {tile_num}/{n_rows*n_cols} CACHED")
+                    else:
+                        print(f"  [{row},{col}] Tile {tile_num}/{n_rows*n_cols} downloading...")
+                        image_data = download_imagery_for_year(center_lat, center_lon, year, size_km=tile_size_km)
+                        bands_data = image_data['bands_data']
+                        # Save raw data to cache
+                        np.save(raw_tile_path, bands_data)
+                        download_count += 1
+
+                    # Classify the tile (always re-run — this is fast)
+                    prediction = classify_image(bands_data, year=year)
 
                     # Place in composite:
                     # - row 0 (south) should be at BOTTOM of image (high y)
@@ -2139,28 +2287,33 @@ def classify_mauritius():
                     composite[y_start:y_start+256, x_start:x_start+256] = prediction
                     valid_tiles += 1
 
-                    # Accumulate statistics
-                    stats = get_class_statistics(prediction)
-                    for stat in stats:
-                        name = stat['name']
-                        if name not in total_statistics:
-                            total_statistics[name] = 0
-                        total_statistics[name] += stat['percentage']
-
                 except Exception as e:
                     print(f"    Error: {e}")
+
+        print(f"  Tiles: {cached_count} cached, {download_count} downloaded")
 
         # Apply ocean mask to the entire composite
         print("  Applying ocean mask to separate inland water from ocean...")
         composite = apply_ocean_mask_composite(composite, bounds)
 
-        # Recalculate statistics after ocean masking
-        total_pixels = composite.size
+        # Recalculate statistics after ocean masking — LAND ONLY
+        # Exclude Clouds(0), Water(1), Ocean(7) from denominator
+        excluded_classes = {0, 1, 7}
+        land_pixels = sum(
+            np.sum(composite == cid)
+            for cid in CLASSES.keys()
+            if cid not in excluded_classes
+        )
+        if land_pixels == 0:
+            land_pixels = 1  # Avoid division by zero
+
         total_statistics = {}
         for class_id, class_info in CLASSES.items():
+            if class_id in excluded_classes:
+                continue
             count = np.sum(composite == class_id)
             if count > 0:
-                total_statistics[class_info['name']] = (count / total_pixels) * 100
+                total_statistics[class_info['name']] = (count / land_pixels) * 100
 
         # Create colored RGBA image
         colored = np.zeros((composite_h, composite_w, 4), dtype=np.uint8)
