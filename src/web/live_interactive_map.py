@@ -27,9 +27,9 @@ app = Flask(__name__)
 # Historical time periods configuration
 TIME_PERIODS = {
     'current': {'start': None, 'end': None, 'satellite': 'sentinel', 'label': 'Current (Last 60 days)'},
-    '2022': {'start': '2022-01-01', 'end': '2022-12-31', 'satellite': 'sentinel', 'label': '2022'},
-    '2019': {'start': '2019-01-01', 'end': '2019-12-31', 'satellite': 'sentinel', 'label': '2019'},
-    '2016': {'start': '2016-01-01', 'end': '2016-12-31', 'satellite': 'sentinel', 'label': '2016'},
+    '2022': {'start': '2021-01-01', 'end': '2023-12-31', 'satellite': 'sentinel', 'label': '2022'},
+    '2019': {'start': '2018-01-01', 'end': '2020-12-31', 'satellite': 'sentinel', 'label': '2019'},
+    '2016': {'start': '2015-06-01', 'end': '2017-12-31', 'satellite': 'sentinel', 'label': '2016'},
     '2013': {'start': '2013-01-01', 'end': '2013-12-31', 'satellite': 'landsat', 'label': '2013'},
     '2010': {'start': '2010-01-01', 'end': '2010-12-31', 'satellite': 'landsat', 'label': '2010'},
 }
@@ -39,6 +39,9 @@ HISTORICAL_STATS = {}
 
 # Cache for full island classification results
 MAURITIUS_CLASSIFICATION_CACHE = {}
+
+# Track which years are currently being classified (prevent duplicate runs on refresh)
+CLASSIFICATION_IN_PROGRESS = {}  # year -> {'tiles_done': int, 'tiles_total': int}
 
 # Configuration
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -273,11 +276,9 @@ def load_model():
     MODEL.encoder.conv1 = new_conv
 
     # Load the 7-class model that produced good results on Jan 24/25
-    checkpoint_path = Path('checkpoints/enhanced_model_old7class.pth')
+    checkpoint_path = Path('checkpoints/enhanced_model.pth')
     if not checkpoint_path.exists():
-        checkpoint_path = Path('checkpoints/enhanced_model_backup_before_wasteland.pth')
-    if not checkpoint_path.exists():
-        checkpoint_path = Path('checkpoints/improved_model.pth')
+        checkpoint_path = Path('checkpoints/enhanced_model_old7class.pth')
     if not checkpoint_path.exists():
         checkpoint_path = Path('checkpoints/best_model.pth')
     if checkpoint_path.exists():
@@ -361,7 +362,7 @@ def download_sentinel2_for_location(lat, lon, size_km=2):
         })
 
         # Download RGB
-        rgb_response = requests.get(rgb_url, timeout=30)
+        rgb_response = requests.get(rgb_url, timeout=90)
         rgb_image = np.array(Image.open(io.BytesIO(rgb_response.content)))
 
         # Get 9-band data as GeoTIFF using rasterio
@@ -373,7 +374,7 @@ def download_sentinel2_for_location(lat, lon, size_km=2):
         })
 
         # Download bands
-        bands_response = requests.get(bands_url, timeout=30)
+        bands_response = requests.get(bands_url, timeout=90)
 
         # Use rasterio to read the GeoTIFF
         with MemoryFile(bands_response.content) as memfile:
@@ -513,7 +514,7 @@ def download_landsat_for_location(lat, lon, year, size_km=2):
             'format': 'png'
         })
 
-        rgb_response = requests.get(rgb_url, timeout=30)
+        rgb_response = requests.get(rgb_url, timeout=90)
         rgb_image = np.array(Image.open(io.BytesIO(rgb_response.content)))
 
         # Get 9-band data
@@ -524,7 +525,7 @@ def download_landsat_for_location(lat, lon, year, size_km=2):
             'format': 'GEO_TIFF'
         })
 
-        bands_response = requests.get(bands_url, timeout=30)
+        bands_response = requests.get(bands_url, timeout=90)
 
         with MemoryFile(bands_response.content) as memfile:
             with memfile.open() as src:
@@ -674,7 +675,7 @@ def download_sentinel2_for_year(lat, lon, year, size_km=2):
             'format': 'png'
         })
 
-        rgb_response = requests.get(rgb_url, timeout=30)
+        rgb_response = requests.get(rgb_url, timeout=90)
         rgb_image = np.array(Image.open(io.BytesIO(rgb_response.content)))
 
         bands_url = full_image.getDownloadURL({
@@ -684,7 +685,7 @@ def download_sentinel2_for_year(lat, lon, year, size_km=2):
             'format': 'GEO_TIFF'
         })
 
-        bands_response = requests.get(bands_url, timeout=30)
+        bands_response = requests.get(bands_url, timeout=90)
 
         with MemoryFile(bands_response.content) as memfile:
             with memfile.open() as src:
@@ -713,6 +714,17 @@ def download_sentinel2_for_year(lat, lon, year, size_km=2):
         return create_fallback_image(lat, lon)
 
 
+def validate_tile(bands_data):
+    """Check if a downloaded tile has valid data (not single-pixel or fallback)."""
+    if bands_data is None or bands_data.ndim != 3 or bands_data.shape[0] != 9:
+        return False
+    # Check if any reflectance band is entirely constant (single pixel expanded)
+    for i in range(6):  # B2-B12
+        if bands_data[i].max() == bands_data[i].min():
+            return False
+    return True
+
+
 def create_fallback_image(lat, lon):
     """Create fallback synthetic image when GEE fails"""
     print(f"Creating fallback image for {lat:.4f}, {lon:.4f}")
@@ -738,7 +750,7 @@ def create_fallback_image(lat, lon):
             # Create synthetic data as ultimate fallback
             rgb_image = np.random.randint(50, 200, (256, 256, 3), dtype=np.uint8)
             bands_data = np.random.rand(9, 256, 256).astype(np.float32)
-            return {'rgb_image': rgb_image, 'bands_data': bands_data}
+            return {'rgb_image': rgb_image, 'bands_data': bands_data, 'is_fallback': True}
 
         # Create RGB from tile
         blue = tile_data[0, :, :]
@@ -754,7 +766,8 @@ def create_fallback_image(lat, lon):
 
         return {
             'rgb_image': rgb_image,
-            'bands_data': tile_data
+            'bands_data': tile_data,
+            'is_fallback': True
         }
 
     # Ultimate fallback: synthetic data
@@ -767,7 +780,7 @@ def create_fallback_image(lat, lon):
     }
 
 
-def classify_image(bands_data, apply_postprocessing=False, year='current'):
+def classify_image(bands_data, apply_postprocessing=False, year='current', spectral_normalizers=None):
     """
     Run 7-class model inference, then remap to 9 display classes.
 
@@ -778,6 +791,13 @@ def classify_image(bands_data, apply_postprocessing=False, year='current'):
     Display classes:
         0=Clouds, 1=Water, 2=Forest, 3=Plantation, 4=Urban, 5=Roads, 6=Bare Land, 7=Ocean, 8=Wasteland
     """
+    # Normalize all 9 bands to match 2019 reference distribution before model inference
+    if spectral_normalizers is not None and 'bands' in spectral_normalizers:
+        bands_data = bands_data.copy()  # Don't modify cached data
+        for i, norm_fn in enumerate(spectral_normalizers['bands']):
+            if norm_fn is not None:
+                bands_data[i] = norm_fn(bands_data[i])
+
     input_tensor = torch.from_numpy(bands_data).float().unsqueeze(0)
     input_tensor = input_tensor.to(DEVICE)
 
@@ -790,7 +810,8 @@ def classify_image(bands_data, apply_postprocessing=False, year='current'):
     unique, counts = np.unique(prediction, return_counts=True)
     print(f"Model output classes (7-class): {dict(zip(unique, counts))}")
 
-    # Remap 7 model classes → 9 display classes using spectral indices
+    # Remap 7 model classes to 9 display classes using spectral indices
+    # bands_data is already normalized, so no additional normalization needed in remap
     display = remap_7_to_9(prediction, bands_data)
 
     # Smooth the classification to remove salt-and-pepper noise
@@ -800,6 +821,94 @@ def classify_image(bands_data, apply_postprocessing=False, year='current'):
     print(f"Display classes (9-class): {dict(zip(unique2, counts2))}")
 
     return display
+
+
+def compute_spectral_stats(year):
+    """Compute per-band and spectral index percentile distributions for a year's cached tiles."""
+    year_tile_dir = RAW_TILES_CACHE_DIR / str(year)
+    stats_path = year_tile_dir / 'spectral_stats_v2.json'
+
+    # Return cached stats if available
+    if stats_path.exists():
+        with open(stats_path, 'r') as f:
+            cached = json.load(f)
+        return {k: np.array(v) for k, v in cached.items()}
+
+    tiles = sorted(year_tile_dir.glob('tile_*.npy'))
+    if not tiles:
+        return None
+
+    # Collect raw values for all 9 bands
+    band_names = ['B2', 'B3', 'B4', 'B8', 'B11', 'B12', 'NDVI', 'NDWI', 'NDBI']
+    all_bands = {i: [] for i in range(9)}
+
+    for tp in tiles:
+        bands = np.load(tp)
+        # Skip ocean-dominated tiles
+        ndwi = bands[7].copy()
+        if np.abs(ndwi).max() > 1.5:
+            ndwi = np.clip(ndwi / 10000.0, -1, 1)
+        if np.mean(ndwi > 0.3) > 0.9:
+            continue
+        for i in range(9):
+            all_bands[i].append(bands[i].flatten())
+
+    percentile_points = np.linspace(0, 100, 1001)
+    result = {}
+    for i in range(9):
+        data = np.concatenate(all_bands[i])
+        result[f'band_{i}_percentiles'] = np.percentile(data, percentile_points)
+
+    with open(stats_path, 'w') as f:
+        json.dump({k: v.tolist() for k, v in result.items()}, f)
+    print(f"  Spectral stats (all 9 bands) computed and cached for {year}")
+    return result
+
+
+def build_normalization_lookup(source_percentiles, reference_percentiles):
+    """Build a quantile-mapping function from source to reference distribution."""
+    pct_axis = np.linspace(0, 100, len(source_percentiles))
+    def normalize(values):
+        ranks = np.interp(values, source_percentiles, pct_axis)
+        return np.interp(ranks, pct_axis, reference_percentiles)
+    return normalize
+
+
+def build_spectral_normalizers(year):
+    """Build normalizers that map any year's spectral values to 2019-equivalent values.
+    Only normalizes for years with different sensor/processing than 2019 (S2_SR_HARMONIZED).
+    Years using same sensor (2019, 2022, current) skip normalization entirely."""
+
+    # Only normalize years with fundamentally different sensor data
+    # 2019, 2022, current all use S2_SR_HARMONIZED -> no normalization needed
+    # 2016 uses S2 TOA -> needs normalization
+    # 2013, 2010 use Landsat -> needs normalization
+    year_str = str(year)
+    needs_normalization = year_str in ('2016', '2013', '2010')
+    if not needs_normalization:
+        return None
+
+    ref_stats = compute_spectral_stats('2019')
+    if ref_stats is None:
+        print("  WARNING: No 2019 reference stats available, skipping normalization")
+        return None
+
+    year_stats = compute_spectral_stats(year)
+    if year_stats is None:
+        print(f"  WARNING: No spectral stats for {year}, skipping normalization")
+        return None
+
+    # Build per-band normalizers for all 9 bands
+    band_normalizers = []
+    for i in range(9):
+        src_key = f'band_{i}_percentiles'
+        ref_key = f'band_{i}_percentiles'
+        if src_key in year_stats and ref_key in ref_stats:
+            band_normalizers.append(build_normalization_lookup(year_stats[src_key], ref_stats[ref_key]))
+        else:
+            band_normalizers.append(None)
+
+    return {'bands': band_normalizers}
 
 
 def remap_7_to_9(prediction, bands_data):
@@ -813,6 +922,7 @@ def remap_7_to_9(prediction, bands_data):
     Target: Forest ~27%, Wasteland ~26%, Plantation ~24%, Urban ~12%, Roads ~7%, Bare Land ~4%
 
     bands_data shape: (9, H, W) - B2, B3, B4, B8, B11, B12, NDVI, NDWI, NDBI
+    Note: bands_data should already be normalized to 2019 reference if from a different year.
     """
     display = np.zeros_like(prediction)
 
@@ -840,33 +950,28 @@ def remap_7_to_9(prediction, bands_data):
     bg = prediction == 0
     display[bg] = 6  # Default: Bare Land
     display[bg & (brightness > 0.25) & (ndwi <= 0.0)] = 0    # Clouds (bright, not water)
-    display[bg & (ndwi > 0.3)] = 7                             # Ocean (strong water signal)
-    display[bg & (ndwi > 0.0) & (ndwi <= 0.3)] = 1            # Shallow water
+    display[bg & (ndwi > 0.15)] = 7                            # Ocean/water (lowered from 0.3)
+    display[bg & (ndwi > 0.0) & (ndwi <= 0.15)] = 1           # Shallow water
     display[bg & (ndwi <= 0.0) & (brightness <= 0.25) & (ndvi >= 0.3)] = 8  # Vegetated bg → Wasteland
 
     # ── Model class 1 (Water in model) → Display Water ──
     display[prediction == 1] = 1
 
     # ── Model class 2 (dominant vegetation, ~71% of land) ──
-    # Split using NDBI (calibrated from P25=-0.37, P50=-0.29, P75=-0.21 of mod2)
-    # Forest: very low NDBI = dense canopy blocking SWIR
-    # Plantation: moderate NDBI = sugarcane rows with soil exposure
-    # Urban: high NDBI = built-up surfaces (concrete, metal roofs)
-    # Wasteland: catch-all for moderate vegetation
     mod2 = prediction == 2
     display[mod2] = 8  # Default: Wasteland (catch-all)
-    display[mod2 & (ndvi >= 0.4) & (ndbi < -0.33)] = 2    # Forest (~25% of land)
-    display[mod2 & (ndvi >= 0.4) & (ndbi >= -0.33) & (ndbi < -0.24)] = 3  # Plantation (~22%)
-    display[mod2 & (ndvi < 0.15) & (ndbi < -0.15)] = 6    # Bare Land (very low NDVI)
-    display[mod2 & (ndbi >= -0.15)] = 4                     # Urban (~9%, high SWIR = built-up)
+    display[mod2 & (ndvi >= 0.3) & (ndbi >= -0.35) & (ndbi < -0.15)] = 3  # Plantation first
+    display[mod2 & (ndvi < 0.15) & (ndbi < -0.15)] = 6         # Bare Land
+    display[mod2 & (ndvi < 0.40) & (ndbi >= -0.15)] = 4        # Urban (A4: NDVI cap 0.3 → 0.40)
+    display[mod2 & (ndvi >= 0.4) & (ndbi < -0.28)] = 2         # Forest LAST (overrides Plantation)
 
     # ── Model class 3 (moderate vegetation, ~19.5% of land) ──
     mod3 = prediction == 3
     display[mod3] = 8  # Default: Wasteland
-    display[mod3 & (ndvi >= 0.5) & (ndbi < -0.35)] = 2    # Dense veg → Forest
-    display[mod3 & (ndvi >= 0.35) & (ndbi >= -0.35) & (ndbi < -0.24)] = 3  # Plantation
-    display[mod3 & (ndbi >= -0.15)] = 4                     # Urban
-    display[mod3 & (ndvi < 0.2)] = 5                        # Low NDVI in mod3 → Roads
+    display[mod3 & (ndvi >= 0.3) & (ndbi >= -0.35) & (ndbi < -0.15)] = 3  # Plantation first
+    display[mod3 & (ndvi < 0.40) & (ndbi >= -0.15)] = 4        # Urban (A4: NDVI cap 0.3 → 0.40)
+    display[mod3 & (ndvi < 0.15) & (ndbi >= -0.05)] = 5        # Roads: very low NDVI + high NDBI
+    display[mod3 & (ndvi >= 0.5) & (ndbi < -0.28)] = 2         # Forest LAST (overrides Plantation)
 
     # ── Model class 4 (low/sparse vegetation, ~4.5% of land) → Roads ──
     mod4 = prediction == 4
@@ -1677,6 +1782,14 @@ HTML_TEMPLATE = '''
                 });
 
                 const data = await response.json();
+
+                // If server says classification is already running, poll for it
+                if (response.status === 202 && data.status === 'in_progress') {
+                    console.log('Classification already in progress, polling...');
+                    pollForCompletion(year);
+                    return;
+                }
+
                 console.log('Received data for year:', year, 'statistics:', data.statistics);
 
                 if (data.classification_image) {
@@ -1754,11 +1867,37 @@ HTML_TEMPLATE = '''
             legendDiv.innerHTML = html;
         }
 
-        // Load initial classification based on dropdown selection
-        setTimeout(() => {
+        // Load initial classification - check if already in progress first
+        setTimeout(async () => {
             const initialYear = document.getElementById('year-selector').value;
-            loadMauritiusClassification(initialYear, true);
+            // Check if server already has a classification running
+            const statusResp = await fetch('/api/classification_status');
+            const statusData = await statusResp.json();
+            if (statusData[initialYear]) {
+                // Already running - show spinner and poll for completion
+                document.getElementById('mauritius-loading').style.display = 'block';
+                pollForCompletion(initialYear);
+            } else {
+                loadMauritiusClassification(initialYear, true);
+            }
         }, 1000);
+
+        // Poll server every 5s until classification completes, then load result
+        async function pollForCompletion(year) {
+            const statusResp = await fetch('/api/classification_status');
+            const statusData = await statusResp.json();
+            if (statusData[year]) {
+                const p = statusData[year];
+                const pct = p.tiles_total > 0 ? Math.round(p.tiles_done / p.tiles_total * 100) : 0;
+                const loadingEl = document.getElementById('mauritius-loading');
+                if (loadingEl) loadingEl.innerHTML = `<span style="font-size:1.5em">&#9685;</span> Classifying Mauritius... ${pct}% (${p.tiles_done}/${p.tiles_total} tiles)`;
+                setTimeout(() => pollForCompletion(year), 5000);
+            } else {
+                // Done - load the result
+                document.getElementById('mauritius-loading').style.display = 'none';
+                loadMauritiusClassification(year, true);
+            }
+        }
 
         // Function to fetch and classify
         function fetchAndClassify(lat, lon, forceRefresh = false) {
@@ -2175,6 +2314,12 @@ def save_classification_to_cache(year, image_data, statistics):
     print(f"Saved classification for {year} to {paths['image']}")
 
 
+@app.route('/api/classification_status', methods=['GET'])
+def classification_status():
+    """Return current classification progress for all in-progress years."""
+    return jsonify(CLASSIFICATION_IN_PROGRESS)
+
+
 @app.route('/api/classify_mauritius', methods=['POST'])
 def classify_mauritius():
     """
@@ -2195,6 +2340,12 @@ def classify_mauritius():
             if cached:
                 print(f"Using CACHED classification for {year} - skipping re-run")
                 return jsonify(cached)
+
+        # If already running for this year, return progress instead of restarting
+        if year in CLASSIFICATION_IN_PROGRESS and not force_reclassify:
+            progress = CLASSIFICATION_IN_PROGRESS[year]
+            print(f"Classification for {year} already in progress: {progress['tiles_done']}/{progress['tiles_total']}")
+            return jsonify({'status': 'in_progress', 'progress': progress}), 202
 
         print(f"\n{'='*60}")
         print(f"Full Mauritius classification for year: {year}")
@@ -2246,9 +2397,20 @@ def classify_mauritius():
         year_tile_dir = RAW_TILES_CACHE_DIR / str(year)
         year_tile_dir.mkdir(parents=True, exist_ok=True)
 
+        # Register as in-progress to prevent duplicate runs on page refresh
+        CLASSIFICATION_IN_PROGRESS[year] = {'tiles_done': 0, 'tiles_total': n_rows * n_cols}
+
         # Count cached vs download needed
         cached_count = 0
         download_count = 0
+
+        # Build spectral normalizers (quantile-map this year's data to 2019 reference)
+        print(f"  Building spectral normalizers for {year}...")
+        spectral_normalizers = build_spectral_normalizers(year)
+        if spectral_normalizers is not None:
+            print(f"  Normalization active: {year} -> 2019 reference distribution")
+        else:
+            print(f"  No normalization needed (reference year or no stats available)")
 
         # Process tiles: row 0 = southernmost, col 0 = westernmost
         for row in range(n_rows):
@@ -2264,19 +2426,37 @@ def classify_mauritius():
                     # Check if raw satellite data is already cached
                     if raw_tile_path.exists():
                         bands_data = np.load(raw_tile_path)
-                        cached_count += 1
-                        if tile_num % 20 == 0 or tile_num == 1:
-                            print(f"  [{row},{col}] Tile {tile_num}/{n_rows*n_cols} CACHED")
-                    else:
-                        print(f"  [{row},{col}] Tile {tile_num}/{n_rows*n_cols} downloading...")
-                        image_data = download_imagery_for_year(center_lat, center_lon, year, size_km=tile_size_km)
-                        bands_data = image_data['bands_data']
-                        # Save raw data to cache
-                        np.save(raw_tile_path, bands_data)
-                        download_count += 1
+                        if not validate_tile(bands_data):
+                            print(f"  [{row},{col}] Tile {tile_num}/{n_rows*n_cols} CACHED but INVALID, re-downloading...")
+                            raw_tile_path.unlink()
+                        else:
+                            cached_count += 1
+                            if tile_num % 20 == 0 or tile_num == 1:
+                                print(f"  [{row},{col}] Tile {tile_num}/{n_rows*n_cols} CACHED")
+
+                    if not raw_tile_path.exists():
+                        # Download with retry
+                        max_retries = 3
+                        for attempt in range(max_retries):
+                            print(f"  [{row},{col}] Tile {tile_num}/{n_rows*n_cols} downloading{' (retry '+str(attempt)+')' if attempt > 0 else ''}...")
+                            image_data = download_imagery_for_year(center_lat, center_lon, year, size_km=tile_size_km)
+                            bands_data = image_data['bands_data']
+                            is_fallback = image_data.get('is_fallback', False)
+                            if not is_fallback and validate_tile(bands_data):
+                                np.save(raw_tile_path, bands_data)
+                                download_count += 1
+                                break
+                            else:
+                                reason = "fallback/training data" if is_fallback else "constant bands"
+                                print(f"    Invalid tile ({reason}), retrying in 5s...")
+                                import time
+                                time.sleep(5)  # Wait before retry
+                        else:
+                            print(f"    WARNING: Tile {tile_num} failed after {max_retries} retries, skipping")
+                            continue
 
                     # Classify the tile (always re-run — this is fast)
-                    prediction = classify_image(bands_data, year=year)
+                    prediction = classify_image(bands_data, year=year, spectral_normalizers=spectral_normalizers)
 
                     # Place in composite:
                     # - row 0 (south) should be at BOTTOM of image (high y)
@@ -2286,9 +2466,13 @@ def classify_mauritius():
 
                     composite[y_start:y_start+256, x_start:x_start+256] = prediction
                     valid_tiles += 1
+                    CLASSIFICATION_IN_PROGRESS[year]['tiles_done'] = valid_tiles
 
                 except Exception as e:
                     print(f"    Error: {e}")
+
+        # Clear in-progress flag now that we're done
+        CLASSIFICATION_IN_PROGRESS.pop(year, None)
 
         print(f"  Tiles: {cached_count} cached, {download_count} downloaded")
 
