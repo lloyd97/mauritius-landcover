@@ -1198,7 +1198,7 @@ HTML_TEMPLATE = '''
 
         #container {
             display: grid;
-            grid-template-columns: 250px 0.8fr 1fr 280px 380px;
+            grid-template-columns: 250px 0.8fr 0.8fr 280px 1fr;
             min-height: calc(100vh - 120px);
             gap: 0;
             overflow-x: auto;
@@ -1452,13 +1452,13 @@ HTML_TEMPLATE = '''
         /* Responsive Design */
         @media (max-width: 1600px) {
             #container {
-                grid-template-columns: 220px 0.8fr 1fr 220px 340px;
+                grid-template-columns: 220px 0.8fr 0.8fr 220px 1fr;
             }
         }
 
         @media (max-width: 1400px) {
             #container {
-                grid-template-columns: 200px 0.8fr 1fr 200px 300px;
+                grid-template-columns: 200px 0.8fr 0.8fr 200px 1fr;
             }
 
             .panel-header {
@@ -1469,7 +1469,7 @@ HTML_TEMPLATE = '''
 
         @media (max-width: 1200px) {
             #container {
-                grid-template-columns: 180px 0.8fr 1fr 180px 260px;
+                grid-template-columns: 180px 0.8fr 0.8fr 180px 1fr;
             }
 
             #header h1 {
@@ -1768,10 +1768,18 @@ HTML_TEMPLATE = '''
             <div class="panel-header">📈 Historical Change Detection</div>
             <div class="panel-content">
                 <div id="change-chart-container">
-                    <div style="margin-bottom: 8px;">
-                        <label style="font-size: 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;">
+                    <div style="margin-bottom: 8px; display: flex; flex-direction: column; gap: 4px;">
+                        <label style="font-size: 11px; cursor: pointer; display: inline-flex; align-items: center; gap: 5px;">
                             <input type="checkbox" id="toggle-2016" checked style="cursor: pointer;">
                             Include 2016 data
+                        </label>
+                        <label style="font-size: 11px; cursor: pointer; display: inline-flex; align-items: center; gap: 5px;">
+                            <input type="checkbox" id="toggle-2030" checked style="cursor: pointer;">
+                            Show 2030 Prediction
+                        </label>
+                        <label style="font-size: 11px; cursor: pointer; display: inline-flex; align-items: center; gap: 5px;">
+                            <input type="checkbox" id="toggle-ldn" checked style="cursor: pointer;">
+                            Show LDN 2030 Target
                         </label>
                     </div>
                     <div id="historical-summary" class="historical-summary">
@@ -2090,17 +2098,33 @@ HTML_TEMPLATE = '''
             // No chart needed - table only
         }
 
-        // Toggle 2016 handler
-        document.getElementById('toggle-2016').addEventListener('change', function() {
-            if (cachedHistoricalData) {
-                updateHistoricalSummary(cachedHistoricalData);
-            }
+        // Toggle handlers
+        ['toggle-2016', 'toggle-2030', 'toggle-ldn'].forEach(id => {
+            document.getElementById(id).addEventListener('change', function() {
+                if (cachedHistoricalData) {
+                    updateHistoricalSummary(cachedHistoricalData);
+                }
+            });
         });
+
+        // Linear regression: returns {slope, intercept}
+        function linearRegression(xs, ys) {
+            const n = xs.length;
+            const sumX = xs.reduce((a, b) => a + b, 0);
+            const sumY = ys.reduce((a, b) => a + b, 0);
+            const sumXY = xs.reduce((a, x, i) => a + x * ys[i], 0);
+            const sumX2 = xs.reduce((a, x) => a + x * x, 0);
+            const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+            const intercept = (sumY - slope * sumX) / n;
+            return { slope, intercept };
+        }
 
         // Update historical summary as a table
         function updateHistoricalSummary(data) {
             cachedHistoricalData = data;
             const include2016 = document.getElementById('toggle-2016').checked;
+            const show2030 = document.getElementById('toggle-2030').checked;
+            const showLdn = document.getElementById('toggle-ldn').checked;
             let years = Object.keys(data.statistics).sort();
             if (!include2016) {
                 years = years.filter(y => y !== '2016');
@@ -2109,18 +2133,58 @@ HTML_TEMPLATE = '''
             const lastYear = years[years.length - 1];
             const classes = ['Plantation', 'Forest', 'Wasteland', 'Urban', 'Bare Land', 'Roads'];
 
+            // Calculate 2030 predictions using linear regression
+            const predictions2030 = {};
+            classes.forEach(className => {
+                const xs = [];
+                const ys = [];
+                years.forEach(year => {
+                    const yearStats = data.statistics[year];
+                    const stat = yearStats.find(s => s.name === className || s.class === className);
+                    if (stat) {
+                        xs.push(parseInt(year));
+                        ys.push(stat.percentage);
+                    }
+                });
+                if (xs.length >= 2) {
+                    const reg = linearRegression(xs, ys);
+                    predictions2030[className] = Math.max(0, reg.slope * 2030 + reg.intercept);
+                }
+            });
+
+            // Normalize predictions to sum to ~100%
+            const predTotal = Object.values(predictions2030).reduce((a, b) => a + b, 0);
+            if (predTotal > 0) {
+                Object.keys(predictions2030).forEach(k => {
+                    predictions2030[k] = predictions2030[k] / predTotal * 100;
+                });
+            }
+
+            // LDN 2030 targets (official Mauritius UNCCD submission)
+            // Total land area: 185,900 ha
+            const ldnTargets = {
+                'Plantation': 38.3,  // 71,182 ha agricultural land target
+                'Forest': 28.1,      // 52,290 ha forest cover target
+                'Urban': 23.8,       // 44,283 ha urban artificial areas
+                'Wasteland': 7.5,    // remaining after other targets
+                'Bare Land': 2.0,
+                'Roads': 0.3
+            };
+
             let summaryHtml = `
-                <table style="width:100%; border-collapse:collapse; font-size:12px;">
+                <table style="width:100%; border-collapse:collapse; font-size:11px;">
                     <thead>
                         <tr style="border-bottom:2px solid #ddd;">
-                            <th style="text-align:left; padding:6px 4px;">Class</th>`;
+                            <th style="text-align:left; padding:5px 3px;">Class</th>`;
             years.forEach(y => {
-                summaryHtml += `<th style="text-align:center; padding:6px 4px;">${y}</th>`;
+                summaryHtml += `<th style="text-align:center; padding:5px 3px;">${y}</th>`;
             });
-            summaryHtml += `<th style="text-align:center; padding:6px 4px;">Change</th></tr></thead><tbody>`;
+            if (show2030) summaryHtml += `<th style="text-align:center; padding:5px 3px; color:#1565C0; border-left:2px solid #1565C0;">2030*</th>`;
+            if (showLdn) summaryHtml += `<th style="text-align:center; padding:5px 3px; color:#E65100; border-left:2px solid #E65100;">LDN†</th>`;
+            summaryHtml += `<th style="text-align:center; padding:5px 3px;">Change</th></tr></thead><tbody>`;
 
             classes.forEach(className => {
-                summaryHtml += `<tr style="border-bottom:1px solid #eee;"><td style="padding:5px 4px; font-weight:500;">${className}</td>`;
+                summaryHtml += `<tr style="border-bottom:1px solid #eee;"><td style="padding:4px 3px; font-weight:500;">${className}</td>`;
                 let firstVal = null, lastVal = null;
                 years.forEach(year => {
                     const yearStats = data.statistics[year];
@@ -2128,15 +2192,26 @@ HTML_TEMPLATE = '''
                     const val = stat ? stat.percentage : 0;
                     if (firstVal === null) firstVal = val;
                     lastVal = val;
-                    summaryHtml += `<td style="text-align:center; padding:5px 4px;">${val.toFixed(1)}%</td>`;
+                    summaryHtml += `<td style="text-align:center; padding:4px 3px;">${val.toFixed(1)}%</td>`;
                 });
-                const change = ((lastVal - firstVal) / firstVal * 100).toFixed(1);
+                // 2030 prediction
+                const pred = predictions2030[className] || 0;
+                if (show2030) summaryHtml += `<td style="text-align:center; padding:4px 3px; color:#1565C0; font-weight:600; border-left:2px solid #1565C0;">${pred.toFixed(1)}%</td>`;
+                // LDN target
+                const ldn = ldnTargets[className] || 0;
+                if (showLdn) summaryHtml += `<td style="text-align:center; padding:4px 3px; color:#E65100; font-weight:600; border-left:2px solid #E65100;">${ldn.toFixed(1)}%</td>`;
+                // Change: from first year to 2030 predicted (if shown) or last actual year
+                const endVal = show2030 ? pred : lastVal;
+                const change = firstVal > 0 ? ((endVal - firstVal) / firstVal * 100).toFixed(1) : '0.0';
                 const color = parseFloat(change) >= 0 ? '#4CAF50' : '#f44336';
                 const arrow = parseFloat(change) >= 0 ? '↑' : '↓';
-                summaryHtml += `<td style="text-align:center; padding:5px 4px; color:${color}; font-weight:600;">${arrow}${Math.abs(change)}%</td></tr>`;
+                summaryHtml += `<td style="text-align:center; padding:4px 3px; color:${color}; font-weight:600;">${arrow}${Math.abs(parseFloat(change))}%</td></tr>`;
             });
 
             summaryHtml += `</tbody></table>`;
+            if (show2030) summaryHtml += `<p style="font-size:10px; color:#999; margin-top:6px;">* 2030 predicted (linear regression from ${firstYear}-${lastYear})</p>`;
+            if (showLdn) summaryHtml += `<p style="font-size:10px; color:#999; margin-top:${show2030 ? '2' : '6'}px;">† LDN = Land Degradation Neutrality targets (Mauritius UNCCD 2030)</p>`;
+            if (!show2030) summaryHtml += `<p style="font-size:10px; color:#999; margin-top:6px;">Change: ${firstYear} → ${lastYear}</p>`;
             document.getElementById('historical-summary').innerHTML = summaryHtml;
         }
 
