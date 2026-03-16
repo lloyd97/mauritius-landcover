@@ -26,11 +26,10 @@ app = Flask(__name__)
 
 # Historical time periods configuration
 TIME_PERIODS = {
-    'current': {'start': None, 'end': None, 'satellite': 'sentinel', 'label': 'Current (Last 60 days)'},
+    '2025': {'start': '2023-01-01', 'end': '2025-12-31', 'satellite': 'sentinel', 'label': '2025'},
     '2022': {'start': '2021-01-01', 'end': '2023-12-31', 'satellite': 'sentinel', 'label': '2022'},
     '2019': {'start': '2018-01-01', 'end': '2020-12-31', 'satellite': 'sentinel', 'label': '2019'},
-    '2016': {'start': '2015-06-01', 'end': '2017-12-31', 'satellite': 'sentinel', 'label': '2016'},
-    '2013': {'start': '2013-01-01', 'end': '2013-12-31', 'satellite': 'landsat', 'label': '2013'},
+    '2016': {'start': '2016-01-01', 'end': '2018-12-31', 'satellite': 'sentinel', 'label': '2016'},
     '2010': {'start': '2010-01-01', 'end': '2010-12-31', 'satellite': 'landsat', 'label': '2010'},
 }
 
@@ -611,9 +610,11 @@ def download_sentinel2_for_year(lat, lon, year, size_km=2):
         collections_to_try = []
         year_int = int(year)
 
-        if year_int >= 2019:
+        # Check end date to determine available collections (window may span multiple years)
+        end_year = int(end_date[:4])
+        if end_year >= 2019:
             collections_to_try = ['COPERNICUS/S2_SR_HARMONIZED', 'COPERNICUS/S2_SR', 'COPERNICUS/S2']
-        elif year_int >= 2017:
+        elif end_year >= 2017:
             collections_to_try = ['COPERNICUS/S2_SR', 'COPERNICUS/S2']
         else:
             collections_to_try = ['COPERNICUS/S2']  # Only TOA available for 2015-2016
@@ -812,7 +813,7 @@ def classify_image(bands_data, apply_postprocessing=False, year='current', spect
 
     # Remap 7 model classes to 9 display classes using spectral indices
     # bands_data is already normalized, so no additional normalization needed in remap
-    display = remap_7_to_9(prediction, bands_data)
+    display = remap_7_to_9(prediction, bands_data, year=year)
 
     # Smooth the classification to remove salt-and-pepper noise
     display = median_filter(display.astype(np.int32), size=5).astype(np.int64)
@@ -877,14 +878,14 @@ def build_normalization_lookup(source_percentiles, reference_percentiles):
 def build_spectral_normalizers(year):
     """Build normalizers that map any year's spectral values to 2019-equivalent values.
     Only normalizes for years with different sensor/processing than 2019 (S2_SR_HARMONIZED).
-    Years using same sensor (2019, 2022, current) skip normalization entirely."""
+    2025 uses S2_SR_HARMONIZED -> no normalization needed."""
 
     # Only normalize years with fundamentally different sensor data
-    # 2019, 2022, current all use S2_SR_HARMONIZED -> no normalization needed
-    # 2016 uses S2 TOA -> needs normalization
-    # 2013, 2010 use Landsat -> needs normalization
+    # 2025 uses S2_SR_HARMONIZED -> no normalization needed
+    # 2015 uses S2 TOA -> needs normalization
+    # 2010 uses Landsat -> needs normalization
     year_str = str(year)
-    needs_normalization = year_str in ('2016', '2013', '2010')
+    needs_normalization = year_str in ('2010',)  # 2016 now uses S2_SR (2016-2018 window)
     if not needs_normalization:
         return None
 
@@ -911,7 +912,7 @@ def build_spectral_normalizers(year):
     return {'bands': band_normalizers}
 
 
-def remap_7_to_9(prediction, bands_data):
+def remap_7_to_9(prediction, bands_data, year='current'):
     """
     Remap 7-class model output to 9 display classes.
 
@@ -919,10 +920,9 @@ def remap_7_to_9(prediction, bands_data):
     the model's coarse classes into finer land cover types.
 
     Thresholds calibrated from spectral analysis of 195 Mauritius tiles.
-    Target: Forest ~27%, Wasteland ~26%, Plantation ~24%, Urban ~12%, Roads ~7%, Bare Land ~4%
+    2016 uses shifted thresholds to account for S2_SR vs S2_SR_HARMONIZED differences.
 
     bands_data shape: (9, H, W) - B2, B3, B4, B8, B11, B12, NDVI, NDWI, NDBI
-    Note: bands_data should already be normalized to 2019 reference if from a different year.
     """
     display = np.zeros_like(prediction)
 
@@ -946,13 +946,72 @@ def remap_7_to_9(prediction, bands_data):
         b, g, r = b / 10000.0, g / 10000.0, r / 10000.0
     brightness = (b + g + r) / 3.0
 
+    # Year-specific thresholds: 2016 S2_SR has NDBI ~+0.06 higher, NDVI ~-0.2 lower vs 2019 S2_SR_HARMONIZED
+    year_str = str(year)
+    if year_str == '2016':
+        ndbi_urban = -0.02     # Urban cutoff (widened further to capture high-NDBI Wasteland as Plantation)
+        ndbi_forest = -0.26    # Forest cutoff (reverted, Forest was good at 26%)
+        ndbi_plant_lo = -0.32  # Plantation lower (widened to capture Wasteland pixels)
+        ndvi_forest2 = 0.25    # Forest NDVI for mod2 (was 0.4, shifted -0.15)
+        ndvi_forest3 = 0.35    # Forest NDVI for mod3 (was 0.5, shifted -0.15)
+        ndvi_plant = 0.08      # Plantation NDVI (lowered to capture more low-NDVI veg from Wasteland)
+        ndvi_urban = 0.25      # Urban NDVI cap (was 0.40, shifted -0.15)
+        ndvi_bare = 0.05       # Bare land NDVI (was 0.15, shifted -0.10)
+        ndvi_road = 0.05       # Road NDVI (was 0.15, shifted -0.10)
+        ndbi_road = 0.02       # Road NDBI (was -0.05, shifted +0.07)
+        ndvi_waste = 0.25      # Wasteland NDVI for mod4 (was 0.4, shifted -0.15)
+        ndbi_urban4 = -0.03    # Urban NDBI for mod4 (was -0.1, shifted +0.07)
+        ndvi_bg_veg = 0.15     # Background vegetation (was 0.3, shifted -0.15)
+    elif year_str == '2022':
+        ndbi_urban = -0.15
+        ndbi_forest = -0.31     # Slightly tighter than default to reduce Forest overcapture
+        ndbi_plant_lo = -0.32
+        ndvi_forest2 = 0.4
+        ndvi_forest3 = 0.5
+        ndvi_plant = 0.3
+        ndvi_urban = 0.40
+        ndvi_bare = 0.15
+        ndvi_road = 0.15
+        ndbi_road = -0.05
+        ndvi_waste = 0.4
+        ndbi_urban4 = -0.1
+        ndvi_bg_veg = 0.3
+    elif year_str == '2025':
+        ndbi_urban = -0.15
+        ndbi_forest = -0.31     # Tighter to push Forest to Plantation
+        ndbi_plant_lo = -0.33   # Wider to capture Wasteland as Plantation
+        ndvi_forest2 = 0.4
+        ndvi_forest3 = 0.5
+        ndvi_plant = 0.3
+        ndvi_urban = 0.40
+        ndvi_bare = 0.15
+        ndvi_road = 0.15
+        ndbi_road = -0.05
+        ndvi_waste = 0.4
+        ndbi_urban4 = -0.1
+        ndvi_bg_veg = 0.3
+    else:
+        ndbi_urban = -0.15
+        ndbi_forest = -0.30
+        ndbi_plant_lo = -0.32
+        ndvi_forest2 = 0.4
+        ndvi_forest3 = 0.5
+        ndvi_plant = 0.3
+        ndvi_urban = 0.40
+        ndvi_bare = 0.15
+        ndvi_road = 0.15
+        ndbi_road = -0.05
+        ndvi_waste = 0.4
+        ndbi_urban4 = -0.1
+        ndvi_bg_veg = 0.3
+
     # ── Model class 0 (Background) → Bare Land / Clouds / Water ──
     bg = prediction == 0
     display[bg] = 6  # Default: Bare Land
     display[bg & (brightness > 0.25) & (ndwi <= 0.0)] = 0    # Clouds (bright, not water)
-    display[bg & (ndwi > 0.15)] = 7                            # Ocean/water (lowered from 0.3)
+    display[bg & (ndwi > 0.15)] = 7                            # Ocean/water
     display[bg & (ndwi > 0.0) & (ndwi <= 0.15)] = 1           # Shallow water
-    display[bg & (ndwi <= 0.0) & (brightness <= 0.25) & (ndvi >= 0.3)] = 8  # Vegetated bg → Wasteland
+    display[bg & (ndwi <= 0.0) & (brightness <= 0.25) & (ndvi >= ndvi_bg_veg)] = 8  # Vegetated bg → Wasteland
 
     # ── Model class 1 (Water in model) → Display Water ──
     display[prediction == 1] = 1
@@ -960,24 +1019,24 @@ def remap_7_to_9(prediction, bands_data):
     # ── Model class 2 (dominant vegetation, ~71% of land) ──
     mod2 = prediction == 2
     display[mod2] = 8  # Default: Wasteland (catch-all)
-    display[mod2 & (ndvi >= 0.3) & (ndbi >= -0.35) & (ndbi < -0.15)] = 3  # Plantation first
-    display[mod2 & (ndvi < 0.15) & (ndbi < -0.15)] = 6         # Bare Land
-    display[mod2 & (ndvi < 0.40) & (ndbi >= -0.15)] = 4        # Urban (A4: NDVI cap 0.3 → 0.40)
-    display[mod2 & (ndvi >= 0.4) & (ndbi < -0.28)] = 2         # Forest LAST (overrides Plantation)
+    display[mod2 & (ndvi >= ndvi_plant) & (ndbi >= ndbi_plant_lo) & (ndbi < ndbi_urban)] = 3  # Plantation first
+    display[mod2 & (ndvi < ndvi_bare) & (ndbi < ndbi_urban)] = 6         # Bare Land
+    display[mod2 & (ndvi < ndvi_urban) & (ndbi >= ndbi_urban)] = 4        # Urban
+    display[mod2 & (ndvi >= ndvi_forest2) & (ndbi < ndbi_forest)] = 2     # Forest LAST (overrides Plantation)
 
     # ── Model class 3 (moderate vegetation, ~19.5% of land) ──
     mod3 = prediction == 3
     display[mod3] = 8  # Default: Wasteland
-    display[mod3 & (ndvi >= 0.3) & (ndbi >= -0.35) & (ndbi < -0.15)] = 3  # Plantation first
-    display[mod3 & (ndvi < 0.40) & (ndbi >= -0.15)] = 4        # Urban (A4: NDVI cap 0.3 → 0.40)
-    display[mod3 & (ndvi < 0.15) & (ndbi >= -0.05)] = 5        # Roads: very low NDVI + high NDBI
-    display[mod3 & (ndvi >= 0.5) & (ndbi < -0.28)] = 2         # Forest LAST (overrides Plantation)
+    display[mod3 & (ndvi >= ndvi_plant) & (ndbi >= ndbi_plant_lo) & (ndbi < ndbi_urban)] = 3  # Plantation first
+    display[mod3 & (ndvi < ndvi_urban) & (ndbi >= ndbi_urban)] = 4        # Urban
+    display[mod3 & (ndvi < ndvi_road) & (ndbi >= ndbi_road)] = 5          # Roads: very low NDVI + high NDBI
+    display[mod3 & (ndvi >= ndvi_forest3) & (ndbi < ndbi_forest)] = 2     # Forest LAST (overrides Plantation)
 
     # ── Model class 4 (low/sparse vegetation, ~4.5% of land) → Roads ──
     mod4 = prediction == 4
     display[mod4] = 5  # Default: Roads
-    display[mod4 & (ndvi >= 0.4)] = 8                       # High NDVI → actually Wasteland
-    display[mod4 & (ndbi >= -0.1)] = 4                      # High NDBI → Urban
+    display[mod4 & (ndvi >= ndvi_waste)] = 8                       # High NDVI → actually Wasteland
+    display[mod4 & (ndbi >= ndbi_urban4)] = 4                      # High NDBI → Urban
 
     # ── Model class 5 (Buildings) → Urban ──
     display[prediction == 5] = 4
@@ -1630,11 +1689,10 @@ HTML_TEMPLATE = '''
         <div class="year-selector-container">
             <label for="year-selector">Imagery Year:</label>
             <select id="year-selector">
-                <option value="current">Current (Last 60 days)</option>
+                <option value="2025">2025</option>
                 <option value="2022">2022</option>
                 <option value="2019">2019</option>
                 <option value="2016">2016</option>
-                <option value="2013">2013 (Landsat)</option>
                 <option value="2010">2010 (Landsat)</option>
             </select>
         </div>
@@ -2011,7 +2069,7 @@ HTML_TEMPLATE = '''
                 body: JSON.stringify({
                     lat: lastFetchedLat,
                     lon: lastFetchedLon,
-                    years: ['2010', '2016', '2022', 'current']
+                    years: ['2010', '2016', '2019', '2022', '2025']
                 })
             })
             .then(r => r.json())
