@@ -26,4 +26,4 @@ EXPOSE 7860
 ENV PYTHONUNBUFFERED=1
 
 # Run the app
-CMD ["gunicorn", "src.web.live_interactive_map:app", "--bind", "0.0.0.0:7860", "--timeout", "120", "--workers", "1"]
+CMD ["gunicorn", "src.web.live_interactive_map:app", "--bind", "0.0.0.0:7860", "--timeout", "600", "--graceful-timeout", "600", "--workers", "1"]
