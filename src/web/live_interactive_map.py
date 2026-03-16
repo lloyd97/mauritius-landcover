@@ -2792,6 +2792,104 @@ def classify_mauritius():
         return jsonify({'error': str(e)}), 500
 
 
+# Background tile pre-download for cloud deployment (HuggingFace)
+import threading
+
+BACKGROUND_DOWNLOAD_STATUS = {}  # year -> {'tiles_done': int, 'tiles_total': int, 'done': bool}
+
+def background_download_tiles(year):
+    """Download all 195 tiles for a year in the background."""
+    try:
+        bounds = MAURITIUS_BOUNDS_FULL
+        n_rows, n_cols = 15, 13
+        km_per_deg_lat = 111.0
+        km_per_deg_lon = 111.0 * np.cos(np.radians(20.25))
+        lat_range = bounds['north'] - bounds['south']
+        lon_range = bounds['east'] - bounds['west']
+        step_lat = lat_range / n_rows
+        step_lon = lon_range / n_cols
+        tile_size_km = max(step_lat * km_per_deg_lat, step_lon * km_per_deg_lon)
+
+        year_tile_dir = RAW_TILES_CACHE_DIR / str(year)
+        year_tile_dir.mkdir(parents=True, exist_ok=True)
+
+        total = n_rows * n_cols
+        BACKGROUND_DOWNLOAD_STATUS[year] = {'tiles_done': 0, 'tiles_total': total, 'done': False}
+
+        cached = 0
+        downloaded = 0
+        for row in range(n_rows):
+            for col in range(n_cols):
+                tile_path = year_tile_dir / f"tile_{row:02d}_{col:02d}.npy"
+                tile_num = row * n_cols + col + 1
+
+                if tile_path.exists():
+                    cached += 1
+                    BACKGROUND_DOWNLOAD_STATUS[year]['tiles_done'] = cached + downloaded
+                    continue
+
+                center_lat = bounds['south'] + (row + 0.5) * step_lat
+                center_lon = bounds['west'] + (col + 0.5) * step_lon
+
+                for attempt in range(3):
+                    try:
+                        print(f"  [BG {year}] Tile {tile_num}/{total} downloading...")
+                        image_data = download_imagery_for_year(center_lat, center_lon, year, size_km=tile_size_km)
+                        bands_data = image_data['bands_data']
+                        if not image_data.get('is_fallback', False) and validate_tile(bands_data):
+                            np.save(tile_path, bands_data)
+                            downloaded += 1
+                            break
+                        else:
+                            import time
+                            time.sleep(5)
+                    except Exception as e:
+                        print(f"  [BG {year}] Tile {tile_num} error: {e}")
+                        import time
+                        time.sleep(10)
+
+                BACKGROUND_DOWNLOAD_STATUS[year]['tiles_done'] = cached + downloaded
+
+        BACKGROUND_DOWNLOAD_STATUS[year]['done'] = True
+        print(f"  [BG {year}] Complete! {cached} cached, {downloaded} downloaded")
+
+        # Now generate the full classification
+        print(f"  [BG {year}] Generating full classification...")
+        # Trigger classification via internal call
+        with app.test_request_context(json={'year': year}):
+            classify_mauritius()
+
+    except Exception as e:
+        print(f"  [BG {year}] Background download failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+@app.route('/api/background_status')
+def background_status():
+    """Return status of background tile downloads."""
+    return jsonify(BACKGROUND_DOWNLOAD_STATUS)
+
+
+def start_background_downloads():
+    """Start background tile downloads for default years."""
+    if not GEE_AVAILABLE:
+        print("GEE not available, skipping background downloads")
+        return
+
+    # Only auto-download on cloud (HuggingFace) where tiles aren't pre-cached
+    default_year = '2022'
+    year_tile_dir = RAW_TILES_CACHE_DIR / default_year
+    existing = list(year_tile_dir.glob('tile_*.npy')) if year_tile_dir.exists() else []
+
+    if len(existing) < 195:
+        print(f"\n[Background] Starting tile download for {default_year} ({len(existing)}/195 cached)")
+        t = threading.Thread(target=background_download_tiles, args=(default_year,), daemon=True)
+        t.start()
+    else:
+        print(f"\n[Background] All tiles cached for {default_year}")
+
+
 # Load model at module level (for gunicorn)
 print("=" * 60)
 print("Live Interactive Map - Mauritius Land Cover")
@@ -2799,6 +2897,9 @@ print("=" * 60)
 load_model()
 print(f"\nUsing device: {DEVICE}")
 print(f"Google Earth Engine: {'Available' if GEE_AVAILABLE else 'Not available (using fallback)'}")
+
+# Start background downloads after model is loaded
+start_background_downloads()
 
 
 if __name__ == '__main__':
