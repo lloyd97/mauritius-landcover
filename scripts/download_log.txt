@@ -1,0 +1,20 @@
+============================================================
+Downloading Sentinel-2 tiles from Mauritius
+============================================================
+GEE not initialized
+GEE not initialized
+GEE not initialized
+GEE not initialized
+GEE not initialized
+GEE not initialized
+GEE not initialized
+GEE not initialized
+
+============================================================
+Dataset creation complete!
+============================================================
+
+Next steps:
+1. Open the labeling tool: ..\data\training/labeling_tool.html
+2. Label the tiles in: ..\data\training/tiles/
+3. Train the model with the labeled data

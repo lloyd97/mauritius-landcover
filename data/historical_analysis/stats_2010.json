@@ -1,0 +1,37 @@
+{
+  "Background": {
+    "pixels": 585625,
+    "percentage": 14.81,
+    "area_km2": 58.56
+  },
+  "Water": {
+    "pixels": 1280038,
+    "percentage": 32.38,
+    "area_km2": 128.0
+  },
+  "Forest": {
+    "pixels": 1010757,
+    "percentage": 25.57,
+    "area_km2": 101.08
+  },
+  "Plantation": {
+    "pixels": 270333,
+    "percentage": 6.84,
+    "area_km2": 27.03
+  },
+  "Urban": {
+    "pixels": 645872,
+    "percentage": 16.34,
+    "area_km2": 64.59
+  },
+  "Roads": {
+    "pixels": 115960,
+    "percentage": 2.93,
+    "area_km2": 11.6
+  },
+  "Bare Land": {
+    "pixels": 44400,
+    "percentage": 1.12,
+    "area_km2": 4.44
+  }
+}

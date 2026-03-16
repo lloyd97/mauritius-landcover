@@ -1,0 +1,2916 @@
+"""
+Live Interactive Map Viewer for Mauritius Land Cover Classification
+Fetches and classifies Sentinel-2/Landsat imagery in real-time as you pan the map
+Supports historical imagery from 2010-present with change detection charts
+"""
+
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+from pathlib import Path
+from flask import Flask, render_template_string, jsonify, request
+import segmentation_models_pytorch as smp
+from PIL import Image
+import io
+import base64
+import ee
+import requests
+from datetime import datetime, timedelta
+import rasterio
+from rasterio.io import MemoryFile
+import json
+from scipy.ndimage import median_filter
+
+app = Flask(__name__)
+
+# Historical time periods configuration
+TIME_PERIODS = {
+    '2025': {'start': '2023-01-01', 'end': '2025-12-31', 'satellite': 'sentinel', 'label': '2025'},
+    '2022': {'start': '2021-01-01', 'end': '2023-12-31', 'satellite': 'sentinel', 'label': '2022'},
+    '2019': {'start': '2018-01-01', 'end': '2020-12-31', 'satellite': 'sentinel', 'label': '2019'},
+    '2016': {'start': '2016-01-01', 'end': '2018-12-31', 'satellite': 'sentinel', 'label': '2016'},
+    '2010': {'start': '2010-01-01', 'end': '2010-12-31', 'satellite': 'landsat', 'label': '2010'},
+}
+
+# Store historical statistics for change detection charts
+HISTORICAL_STATS = {}
+
+# Cache for full island classification results
+MAURITIUS_CLASSIFICATION_CACHE = {}
+
+# Track which years are currently being classified (prevent duplicate runs on refresh)
+CLASSIFICATION_IN_PROGRESS = {}  # year -> {'tiles_done': int, 'tiles_total': int}
+
+# Configuration
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+MODEL = None
+DATA_DIR = Path('data/live_imagery')
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Mauritius bounds
+MAURITIUS_BOUNDS = {
+    'min_lon': 57.30,
+    'max_lon': 57.82,
+    'min_lat': -20.53,
+    'max_lat': -19.98,
+    'center_lat': -20.25,
+    'center_lon': 57.55
+}
+
+# Land cover classes - Apple Maps inspired color palette
+# Designed to match Apple Maps aesthetic: soft blues, natural greens, warm grays
+CLASSES = {
+    0: {'name': 'Clouds', 'color': [255, 255, 255]},          # White for clouds
+    1: {'name': 'Water', 'color': [168, 216, 234]},           # Soft light blue - inland water (lakes, rivers)
+    2: {'name': 'Forest', 'color': [34, 139, 34]},            # Forest green - dense vegetation (NDVI > 0.7)
+    3: {'name': 'Plantation', 'color': [218, 165, 32]},       # Goldenrod/yellow - agricultural (sugarcane, crops)
+    4: {'name': 'Urban', 'color': [215, 204, 200]},           # Warm gray/tan (Apple Maps buildings)
+    5: {'name': 'Roads', 'color': [158, 158, 158]},           # Medium gray (Apple Maps roads)
+    6: {'name': 'Bare Land', 'color': [239, 235, 233]},       # Sandy cream (Apple Maps bare areas)
+    7: {'name': 'Ocean', 'color': [135, 190, 220]},           # Darker blue - ocean/sea water
+    8: {'name': 'Wasteland', 'color': [189, 183, 107]}        # Khaki/olive - sparse vegetation, scrubland
+}
+
+# Initialize Earth Engine
+GEE_AVAILABLE = False
+try:
+    # Check for EARTHENGINE_TOKEN environment variable (for cloud deployment)
+    ee_token = os.environ.get('EARTHENGINE_TOKEN')
+    if ee_token:
+        credentials_dict = json.loads(ee_token)
+
+        if 'private_key' in credentials_dict:
+            # Service account credentials
+            credentials = ee.ServiceAccountCredentials(None, key_data=credentials_dict)
+            ee.Initialize(credentials)
+        else:
+            # OAuth refresh token - write to EE's expected credentials location
+            ee_credentials_dir = os.path.expanduser('~/.config/earthengine')
+            os.makedirs(ee_credentials_dir, exist_ok=True)
+            credentials_path = os.path.join(ee_credentials_dir, 'credentials')
+            with open(credentials_path, 'w') as f:
+                json.dump(credentials_dict, f)
+            print(f"Wrote credentials to {credentials_path}")
+
+            # Initialize with project
+            project = credentials_dict.get('project')
+            if project:
+                ee.Initialize(project=project)
+            else:
+                ee.Initialize()
+        print("SUCCESS: Google Earth Engine initialized from EARTHENGINE_TOKEN")
+    else:
+        ee.Initialize()
+        print("SUCCESS: Google Earth Engine initialized from local credentials")
+    GEE_AVAILABLE = True
+except Exception as e:
+    print(f"WARNING: GEE initialization failed: {e}")
+
+
+# Mauritius land mask - cached at module level
+MAURITIUS_LAND_MASK = None
+
+def get_mauritius_land_mask():
+    """
+    Get a land mask for Mauritius using GEE's country boundaries.
+    Returns an ee.Image where land=1 and ocean=0.
+    """
+    global MAURITIUS_LAND_MASK
+
+    if MAURITIUS_LAND_MASK is not None:
+        return MAURITIUS_LAND_MASK
+
+    if not GEE_AVAILABLE:
+        return None
+
+    try:
+        # Use LSIB (Large Scale International Boundary) dataset for country boundaries
+        # Filter for Mauritius
+        countries = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+        mauritius = countries.filter(ee.Filter.eq('country_na', 'Mauritius'))
+
+        # Create a mask image: 1 inside Mauritius, 0 outside
+        MAURITIUS_LAND_MASK = ee.Image.constant(1).clip(mauritius).unmask(0)
+        print("SUCCESS: Loaded Mauritius land boundary mask")
+        return MAURITIUS_LAND_MASK
+    except Exception as e:
+        print(f"WARNING: Could not load Mauritius land mask: {e}")
+        return None
+
+
+def apply_ocean_mask_composite(composite, bounds):
+    """
+    Apply ocean mask to the full composite classification image.
+    Water pixels outside Mauritius land boundary become 'Ocean' (class 7).
+
+    Uses chunked processing to avoid GEE's sampleRectangle pixel limit (262144).
+
+    Args:
+        composite: numpy array of class predictions (full mosaic)
+        bounds: dict with north, south, east, west coordinates (full Mauritius bounds)
+
+    Returns:
+        Modified composite with ocean pixels marked as class 7
+    """
+    if not GEE_AVAILABLE:
+        print("    GEE not available, skipping ocean mask")
+        return composite
+
+    land_mask_ee = get_mauritius_land_mask()
+    if land_mask_ee is None:
+        print("    Land mask not available, skipping ocean mask")
+        return composite
+
+    try:
+        h, w = composite.shape
+        print(f"    Composite shape: {h}x{w} = {h*w} pixels")
+
+        # GEE limit is 262144 pixels per sampleRectangle call
+        # Use 450x450 chunks (202500 pixels) to stay safely under the limit
+        chunk_size = 450
+        n_chunks_y = (h + chunk_size - 1) // chunk_size
+        n_chunks_x = (w + chunk_size - 1) // chunk_size
+
+        print(f"    Processing land mask in {n_chunks_y}x{n_chunks_x} = {n_chunks_y * n_chunks_x} chunks")
+
+        lat_range = bounds['north'] - bounds['south']
+        lon_range = bounds['east'] - bounds['west']
+
+        land_mask_np = np.zeros((h, w), dtype=np.uint8)
+
+        for cy in range(n_chunks_y):
+            for cx in range(n_chunks_x):
+                # Pixel coordinates for this chunk
+                y_start = cy * chunk_size
+                y_end = min((cy + 1) * chunk_size, h)
+                x_start = cx * chunk_size
+                x_end = min((cx + 1) * chunk_size, w)
+
+                chunk_h = y_end - y_start
+                chunk_w = x_end - x_start
+
+                # Geographic bounds for this chunk
+                # Note: y=0 is top (north), y=h is bottom (south)
+                chunk_north = bounds['north'] - (y_start / h) * lat_range
+                chunk_south = bounds['north'] - (y_end / h) * lat_range
+                chunk_west = bounds['west'] + (x_start / w) * lon_range
+                chunk_east = bounds['west'] + (x_end / w) * lon_range
+
+                try:
+                    region = ee.Geometry.Rectangle([chunk_west, chunk_south, chunk_east, chunk_north])
+
+                    # Scale to match chunk resolution
+                    scale = (chunk_north - chunk_south) * 111000 / chunk_h
+
+                    chunk_mask = land_mask_ee.reproject(crs='EPSG:4326', scale=scale).sampleRectangle(
+                        region=region,
+                        defaultValue=0
+                    ).get('constant').getInfo()
+
+                    chunk_mask = np.array(chunk_mask)
+
+                    # Resize if needed
+                    if chunk_mask.shape != (chunk_h, chunk_w):
+                        chunk_pil = Image.fromarray(chunk_mask.astype(np.uint8))
+                        chunk_pil = chunk_pil.resize((chunk_w, chunk_h), Image.NEAREST)
+                        chunk_mask = np.array(chunk_pil)
+
+                    land_mask_np[y_start:y_end, x_start:x_end] = chunk_mask
+
+                except Exception as chunk_e:
+                    print(f"      Chunk [{cy},{cx}] error: {chunk_e}")
+                    # Leave as 0 (ocean) if can't get mask
+
+        # Mark ALL pixels outside land boundary as Ocean (class 7)
+        # This is critical: the model classifies pure ocean tiles as Forest, Wasteland, etc.
+        # We must override ALL non-land pixels, not just Water-classed ones
+        outside_land = land_mask_np == 0
+
+        ocean_count = np.sum(outside_land)
+        land_count = np.sum(land_mask_np == 1)
+        print(f"    Pixels outside land boundary (-> Ocean): {ocean_count}")
+        print(f"    Pixels inside land boundary (kept): {land_count}")
+
+        composite_masked = composite.copy()
+        composite_masked[outside_land] = 7  # Mark ALL non-land as Ocean
+
+        return composite_masked
+
+    except Exception as e:
+        print(f"    Warning: Could not apply ocean mask: {e}")
+        import traceback
+        traceback.print_exc()
+        return composite
+
+
+def load_model():
+    """Load trained U-Net model (7-class model, remapped to 9 display classes)"""
+    global MODEL
+
+    print("Loading model...")
+    MODEL = smp.Unet(
+        encoder_name='resnet50',
+        encoder_weights='imagenet',
+        in_channels=3,
+        classes=7,
+        activation=None
+    )
+
+    # Modify first conv for 9 channels
+    first_conv = MODEL.encoder.conv1
+    new_conv = nn.Conv2d(
+        9, first_conv.out_channels,
+        kernel_size=first_conv.kernel_size,
+        stride=first_conv.stride,
+        padding=first_conv.padding,
+        bias=first_conv.bias is not None
+    )
+
+    with torch.no_grad():
+        new_conv.weight[:, :3, :, :] = first_conv.weight[:, :3, :, :]
+        nn.init.kaiming_normal_(new_conv.weight[:, 3:, :, :], mode='fan_out', nonlinearity='relu')
+        new_conv.weight[:, 3:, :, :] *= 0.01
+
+    MODEL.encoder.conv1 = new_conv
+
+    # Load the 7-class model that produced good results on Jan 24/25
+    checkpoint_path = Path('checkpoints/enhanced_model.pth')
+    if not checkpoint_path.exists():
+        checkpoint_path = Path('checkpoints/enhanced_model_old7class.pth')
+    if not checkpoint_path.exists():
+        checkpoint_path = Path('checkpoints/best_model.pth')
+    if checkpoint_path.exists():
+        checkpoint = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
+        MODEL.load_state_dict(checkpoint['model_state_dict'])
+        print(f"SUCCESS: Loaded model from {checkpoint_path}")
+    else:
+        print("WARNING: No checkpoint found")
+
+    MODEL.to(DEVICE)
+    MODEL.eval()
+
+
+def download_sentinel2_for_location(lat, lon, size_km=2):
+    """
+    Download Sentinel-2 imagery for a specific location
+
+    Args:
+        lat: Latitude
+        lon: Longitude
+        size_km: Size of area to download in km (default 2km x 2km)
+
+    Returns:
+        dict with 'rgb_image' and 'bands_data'
+    """
+    if not GEE_AVAILABLE:
+        return create_fallback_image(lat, lon)
+
+    try:
+        print(f"Downloading Sentinel-2 for: {lat:.4f}, {lon:.4f}")
+
+        # Calculate bounds (approximately size_km x size_km)
+        # 1 degree latitude ~ 111 km
+        lat_offset = (size_km / 111.0) / 2
+        lon_offset = (size_km / (111.0 * np.cos(np.radians(lat)))) / 2
+
+        bounds = ee.Geometry.Rectangle([
+            lon - lon_offset,
+            lat - lat_offset,
+            lon + lon_offset,
+            lat + lat_offset
+        ])
+
+        # Get recent Sentinel-2 imagery (last 60 days)
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=60)
+
+        s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') \
+            .filterBounds(bounds) \
+            .filterDate(start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')) \
+            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20)) \
+            .select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'])
+
+        # Get median composite
+        image = s2.median().clip(bounds)
+
+        # Calculate indices
+        def calc_ndvi(img):
+            return img.normalizedDifference(['B8', 'B4']).rename('NDVI')
+
+        def calc_ndwi(img):
+            return img.normalizedDifference(['B3', 'B8']).rename('NDWI')
+
+        def calc_ndbi(img):
+            return img.normalizedDifference(['B11', 'B8']).rename('NDBI')
+
+        ndvi = calc_ndvi(image)
+        ndwi = calc_ndwi(image)
+        ndbi = calc_ndbi(image)
+
+        # Combine all bands
+        full_image = image.addBands([ndvi, ndwi, ndbi])
+
+        # Get RGB thumbnail URL
+        rgb_url = image.getThumbURL({
+            'bands': ['B4', 'B3', 'B2'],
+            'min': 0,
+            'max': 3000,
+            'dimensions': 256,
+            'format': 'png'
+        })
+
+        # Download RGB
+        rgb_response = requests.get(rgb_url, timeout=90)
+        rgb_image = np.array(Image.open(io.BytesIO(rgb_response.content)))
+
+        # Get 9-band data as GeoTIFF using rasterio
+        bands_url = full_image.getDownloadURL({
+            'bands': ['B2', 'B3', 'B4', 'B8', 'B11', 'B12', 'NDVI', 'NDWI', 'NDBI'],
+            'region': bounds,
+            'scale': 10,
+            'format': 'GEO_TIFF'
+        })
+
+        # Download bands
+        bands_response = requests.get(bands_url, timeout=90)
+
+        # Use rasterio to read the GeoTIFF
+        with MemoryFile(bands_response.content) as memfile:
+            with memfile.open() as src:
+                bands_data = src.read().astype(np.float32)  # Returns (bands, height, width)
+
+        print(f"Downloaded bands data shape: {bands_data.shape}")
+        print(f"GEE data range BEFORE normalization: min={bands_data.min():.4f}, max={bands_data.max():.4f}, mean={bands_data.mean():.4f}")
+
+        # DO NOT NORMALIZE - training data is in raw Sentinel-2 values (range: -0.8 to 6592)
+        # Keeping data in raw format to match training data
+        # for i in range(bands_data.shape[0]):
+        #     band = bands_data[i]
+        #     if band.max() > 1.0:
+        #         bands_data[i] = band / 10000.0  # Sentinel-2 scale factor
+
+        # Ensure correct size
+        if rgb_image.shape[:2] != (256, 256):
+            rgb_image = np.array(Image.fromarray(rgb_image).resize((256, 256)))
+
+        if bands_data.shape[1:] != (256, 256):
+            resized_bands = []
+            for i in range(bands_data.shape[0]):
+                band_img = Image.fromarray(bands_data[i])
+                band_resized = np.array(band_img.resize((256, 256), Image.BILINEAR))
+                resized_bands.append(band_resized)
+            bands_data = np.stack(resized_bands, axis=0)
+
+        print(f"Successfully downloaded: RGB {rgb_image.shape}, Bands {bands_data.shape}")
+
+        return {
+            'rgb_image': rgb_image,
+            'bands_data': bands_data
+        }
+
+    except Exception as e:
+        print(f"Error downloading Sentinel-2: {e}")
+        import traceback
+        traceback.print_exc()
+        return create_fallback_image(lat, lon)
+
+
+def download_landsat_for_location(lat, lon, year, size_km=2):
+    """
+    Download Landsat imagery for a specific location and year (for 2010-2013)
+
+    Args:
+        lat: Latitude
+        lon: Longitude
+        year: Year string (e.g., '2010', '2013')
+        size_km: Size of area in km
+
+    Returns:
+        dict with 'rgb_image' and 'bands_data'
+    """
+    if not GEE_AVAILABLE:
+        return create_fallback_image(lat, lon)
+
+    try:
+        print(f"Downloading Landsat {year} for: {lat:.4f}, {lon:.4f}")
+
+        period = TIME_PERIODS[year]
+        start_date = period['start']
+        end_date = period['end']
+
+        # Calculate bounds
+        lat_offset = (size_km / 111.0) / 2
+        lon_offset = (size_km / (111.0 * np.cos(np.radians(lat)))) / 2
+
+        bounds = ee.Geometry.Rectangle([
+            lon - lon_offset,
+            lat - lat_offset,
+            lon + lon_offset,
+            lat + lat_offset
+        ])
+
+        # Use Landsat 7 for 2010-2013 (Landsat 8 starts 2013)
+        if int(year) <= 2012:
+            collection = 'LANDSAT/LE07/C02/T1_L2'
+            bands = ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7']
+            rgb_bands = ['SR_B3', 'SR_B2', 'SR_B1']
+            nir_band = 'SR_B4'
+            swir1_band = 'SR_B5'
+            swir2_band = 'SR_B7'
+            green_band = 'SR_B2'
+        else:
+            collection = 'LANDSAT/LC08/C02/T1_L2'
+            bands = ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7']
+            rgb_bands = ['SR_B4', 'SR_B3', 'SR_B2']
+            nir_band = 'SR_B5'
+            swir1_band = 'SR_B6'
+            swir2_band = 'SR_B7'
+            green_band = 'SR_B3'
+
+        landsat = ee.ImageCollection(collection) \
+            .filterBounds(bounds) \
+            .filterDate(start_date, end_date) \
+            .filter(ee.Filter.lt('CLOUD_COVER', 30)) \
+            .select(bands)
+
+        if landsat.size().getInfo() == 0:
+            print(f"No Landsat imagery found for {year}, trying higher cloud tolerance...")
+            landsat = ee.ImageCollection(collection) \
+                .filterBounds(bounds) \
+                .filterDate(start_date, end_date) \
+                .filter(ee.Filter.lt('CLOUD_COVER', 50)) \
+                .select(bands)
+
+        if landsat.size().getInfo() == 0:
+            print(f"Still no imagery for {year}")
+            return create_fallback_image(lat, lon)
+
+        image = landsat.median().clip(bounds)
+
+        # Calculate indices using Landsat bands
+        # Rename bands to generic names for index calculation
+        if int(year) <= 2012:
+            image = image.rename(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'])
+        else:
+            image = image.rename(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'])
+
+        # NDVI = (NIR - Red) / (NIR + Red)
+        ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI')
+        # NDWI = (Green - NIR) / (Green + NIR)
+        ndwi = image.normalizedDifference(['B3', 'B8']).rename('NDWI')
+        # NDBI = (SWIR1 - NIR) / (SWIR1 + NIR)
+        ndbi = image.normalizedDifference(['B11', 'B8']).rename('NDBI')
+
+        full_image = image.addBands([ndvi, ndwi, ndbi])
+
+        # Get RGB thumbnail
+        rgb_url = image.getThumbURL({
+            'bands': ['B4', 'B3', 'B2'],
+            'min': 7000,
+            'max': 20000,
+            'dimensions': 256,
+            'format': 'png'
+        })
+
+        rgb_response = requests.get(rgb_url, timeout=90)
+        rgb_image = np.array(Image.open(io.BytesIO(rgb_response.content)))
+
+        # Get 9-band data
+        bands_url = full_image.getDownloadURL({
+            'bands': ['B2', 'B3', 'B4', 'B8', 'B11', 'B12', 'NDVI', 'NDWI', 'NDBI'],
+            'region': bounds,
+            'scale': 30,  # Landsat resolution
+            'format': 'GEO_TIFF'
+        })
+
+        bands_response = requests.get(bands_url, timeout=90)
+
+        with MemoryFile(bands_response.content) as memfile:
+            with memfile.open() as src:
+                bands_data = src.read().astype(np.float32)
+
+        # Scale Landsat values to match Sentinel-2 range for model compatibility
+        # Landsat L2 surface reflectance scale factor is 0.0000275, offset -0.2
+        for i in range(6):  # First 6 bands are reflectance
+            bands_data[i] = bands_data[i] * 0.0000275 - 0.2
+            bands_data[i] = bands_data[i] * 10000  # Scale to match Sentinel-2
+
+        print(f"Landsat data shape: {bands_data.shape}")
+
+        # Resize if needed
+        if rgb_image.shape[:2] != (256, 256):
+            rgb_image = np.array(Image.fromarray(rgb_image).resize((256, 256)))
+
+        if bands_data.shape[1:] != (256, 256):
+            resized_bands = []
+            for i in range(bands_data.shape[0]):
+                band_img = Image.fromarray(bands_data[i])
+                band_resized = np.array(band_img.resize((256, 256), Image.BILINEAR))
+                resized_bands.append(band_resized)
+            bands_data = np.stack(resized_bands, axis=0)
+
+        return {
+            'rgb_image': rgb_image,
+            'bands_data': bands_data
+        }
+
+    except Exception as e:
+        print(f"Error downloading Landsat: {e}")
+        import traceback
+        traceback.print_exc()
+        return create_fallback_image(lat, lon)
+
+
+def download_imagery_for_year(lat, lon, year='current', size_km=2):
+    """
+    Download satellite imagery for a specific year
+    Routes to appropriate satellite (Sentinel-2 or Landsat)
+    """
+    if year == 'current':
+        return download_sentinel2_for_location(lat, lon, size_km)
+
+    period = TIME_PERIODS.get(year)
+    if not period:
+        print(f"Unknown year: {year}, using current")
+        return download_sentinel2_for_location(lat, lon, size_km)
+
+    if period['satellite'] == 'landsat':
+        return download_landsat_for_location(lat, lon, year, size_km)
+    else:
+        return download_sentinel2_for_year(lat, lon, year, size_km)
+
+
+def download_sentinel2_for_year(lat, lon, year, size_km=2):
+    """Download Sentinel-2 imagery for a specific year"""
+    if not GEE_AVAILABLE:
+        return create_fallback_image(lat, lon)
+
+    try:
+        print(f"Downloading Sentinel-2 {year} for: {lat:.4f}, {lon:.4f}")
+
+        period = TIME_PERIODS[year]
+        start_date = period['start']
+        end_date = period['end']
+
+        lat_offset = (size_km / 111.0) / 2
+        lon_offset = (size_km / (111.0 * np.cos(np.radians(lat)))) / 2
+
+        bounds = ee.Geometry.Rectangle([
+            lon - lon_offset,
+            lat - lat_offset,
+            lon + lon_offset,
+            lat + lat_offset
+        ])
+
+        # Try different Sentinel-2 collections based on year
+        # S2_SR_HARMONIZED: 2019+
+        # S2_SR: 2017+
+        # S2: 2015+ (TOA, not surface reflectance)
+        collections_to_try = []
+        year_int = int(year)
+
+        # Check end date to determine available collections (window may span multiple years)
+        end_year = int(end_date[:4])
+        if end_year >= 2019:
+            collections_to_try = ['COPERNICUS/S2_SR_HARMONIZED', 'COPERNICUS/S2_SR', 'COPERNICUS/S2']
+        elif end_year >= 2017:
+            collections_to_try = ['COPERNICUS/S2_SR', 'COPERNICUS/S2']
+        else:
+            collections_to_try = ['COPERNICUS/S2']  # Only TOA available for 2015-2016
+
+        s2 = None
+        used_collection = None
+
+        for collection in collections_to_try:
+            print(f"  Trying {collection}...")
+            s2_test = ee.ImageCollection(collection) \
+                .filterBounds(bounds) \
+                .filterDate(start_date, end_date) \
+                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)) \
+                .select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'])
+
+            count = s2_test.size().getInfo()
+            print(f"    Found {count} images")
+
+            if count > 0:
+                s2 = s2_test
+                used_collection = collection
+                break
+
+        # If no imagery found with 30% cloud, try with 50%
+        if s2 is None or s2.size().getInfo() == 0:
+            for collection in collections_to_try:
+                print(f"  Trying {collection} with relaxed cloud filter...")
+                s2_test = ee.ImageCollection(collection) \
+                    .filterBounds(bounds) \
+                    .filterDate(start_date, end_date) \
+                    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 50)) \
+                    .select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'])
+
+                count = s2_test.size().getInfo()
+                if count > 0:
+                    s2 = s2_test
+                    used_collection = collection
+                    print(f"    Found {count} images")
+                    break
+
+        if s2 is None or s2.size().getInfo() == 0:
+            print(f"  No Sentinel-2 imagery found for {year}")
+            return create_fallback_image(lat, lon)
+
+        print(f"  Using {used_collection} with {s2.size().getInfo()} images")
+        image = s2.median().clip(bounds)
+
+        ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI')
+        ndwi = image.normalizedDifference(['B3', 'B8']).rename('NDWI')
+        ndbi = image.normalizedDifference(['B11', 'B8']).rename('NDBI')
+
+        full_image = image.addBands([ndvi, ndwi, ndbi])
+
+        rgb_url = image.getThumbURL({
+            'bands': ['B4', 'B3', 'B2'],
+            'min': 0,
+            'max': 3000,
+            'dimensions': 256,
+            'format': 'png'
+        })
+
+        rgb_response = requests.get(rgb_url, timeout=90)
+        rgb_image = np.array(Image.open(io.BytesIO(rgb_response.content)))
+
+        bands_url = full_image.getDownloadURL({
+            'bands': ['B2', 'B3', 'B4', 'B8', 'B11', 'B12', 'NDVI', 'NDWI', 'NDBI'],
+            'region': bounds,
+            'scale': 10,
+            'format': 'GEO_TIFF'
+        })
+
+        bands_response = requests.get(bands_url, timeout=90)
+
+        with MemoryFile(bands_response.content) as memfile:
+            with memfile.open() as src:
+                bands_data = src.read().astype(np.float32)
+
+        if rgb_image.shape[:2] != (256, 256):
+            rgb_image = np.array(Image.fromarray(rgb_image).resize((256, 256)))
+
+        if bands_data.shape[1:] != (256, 256):
+            resized_bands = []
+            for i in range(bands_data.shape[0]):
+                band_img = Image.fromarray(bands_data[i])
+                band_resized = np.array(band_img.resize((256, 256), Image.BILINEAR))
+                resized_bands.append(band_resized)
+            bands_data = np.stack(resized_bands, axis=0)
+
+        return {
+            'rgb_image': rgb_image,
+            'bands_data': bands_data
+        }
+
+    except Exception as e:
+        print(f"Error downloading Sentinel-2 for {year}: {e}")
+        import traceback
+        traceback.print_exc()
+        return create_fallback_image(lat, lon)
+
+
+def validate_tile(bands_data):
+    """Check if a downloaded tile has valid data (not single-pixel or fallback)."""
+    if bands_data is None or bands_data.ndim != 3 or bands_data.shape[0] != 9:
+        return False
+    # Check if any reflectance band is entirely constant (single pixel expanded)
+    for i in range(6):  # B2-B12
+        if bands_data[i].max() == bands_data[i].min():
+            return False
+    return True
+
+
+def create_fallback_image(lat, lon):
+    """Create fallback synthetic image when GEE fails"""
+    print(f"Creating fallback image for {lat:.4f}, {lon:.4f}")
+
+    # Use training tiles as fallback
+    tiles_dir = Path('data/training/tiles')
+    all_npys = list(tiles_dir.glob('*.npy'))
+
+    # Filter out mask files - only keep tile files
+    all_tiles = [f for f in all_npys if '_mask' not in f.name and '_tile_' in f.name]
+
+    if all_tiles:
+        # Pick a random tile based on coordinates
+        idx = int(abs(lat * 1000 + lon * 1000)) % len(all_tiles)
+        tile_path = all_tiles[idx]
+        tile_data = np.load(tile_path).astype(np.float32)
+
+        print(f"Using fallback tile: {tile_path.name}, shape: {tile_data.shape}")
+
+        # Validate shape
+        if tile_data.ndim != 3 or tile_data.shape[0] != 9:
+            print(f"ERROR: Invalid tile shape {tile_data.shape}, expected (9, H, W)")
+            # Create synthetic data as ultimate fallback
+            rgb_image = np.random.randint(50, 200, (256, 256, 3), dtype=np.uint8)
+            bands_data = np.random.rand(9, 256, 256).astype(np.float32)
+            return {'rgb_image': rgb_image, 'bands_data': bands_data, 'is_fallback': True}
+
+        # Create RGB from tile
+        blue = tile_data[0, :, :]
+        green = tile_data[1, :, :]
+        red = tile_data[2, :, :]
+
+        def normalize(band):
+            vmin, vmax = np.percentile(band, [2, 98])
+            band = np.clip((band - vmin) / (vmax - vmin + 1e-8) * 255, 0, 255)
+            return band.astype(np.uint8)
+
+        rgb_image = np.stack([normalize(red), normalize(green), normalize(blue)], axis=-1)
+
+        return {
+            'rgb_image': rgb_image,
+            'bands_data': tile_data,
+            'is_fallback': True
+        }
+
+    # Ultimate fallback: synthetic data
+    rgb_image = np.random.randint(0, 255, (256, 256, 3), dtype=np.uint8)
+    bands_data = np.random.rand(9, 256, 256).astype(np.float32)
+
+    return {
+        'rgb_image': rgb_image,
+        'bands_data': bands_data
+    }
+
+
+def classify_image(bands_data, apply_postprocessing=False, year='current', spectral_normalizers=None):
+    """
+    Run 7-class model inference, then remap to 9 display classes.
+
+    Model classes (trained labels vs actual spectral meaning):
+        0=Background (mixed), 1=Roads (actually water), 2=Water (actually forest),
+        3=Forest (actually moderate veg), 4=Plantation (low veg), 5=Buildings (urban), 6=Bare Land
+
+    Display classes:
+        0=Clouds, 1=Water, 2=Forest, 3=Plantation, 4=Urban, 5=Roads, 6=Bare Land, 7=Ocean, 8=Wasteland
+    """
+    # Normalize all 9 bands to match 2019 reference distribution before model inference
+    if spectral_normalizers is not None and 'bands' in spectral_normalizers:
+        bands_data = bands_data.copy()  # Don't modify cached data
+        for i, norm_fn in enumerate(spectral_normalizers['bands']):
+            if norm_fn is not None:
+                bands_data[i] = norm_fn(bands_data[i])
+
+    input_tensor = torch.from_numpy(bands_data).float().unsqueeze(0)
+    input_tensor = input_tensor.to(DEVICE)
+
+    with torch.no_grad():
+        output = MODEL(input_tensor)
+        prediction = torch.argmax(output, dim=1).squeeze(0)
+        prediction = prediction.cpu().numpy()
+
+    # Debug: show model output before remapping
+    unique, counts = np.unique(prediction, return_counts=True)
+    print(f"Model output classes (7-class): {dict(zip(unique, counts))}")
+
+    # Remap 7 model classes to 9 display classes using spectral indices
+    # bands_data is already normalized, so no additional normalization needed in remap
+    display = remap_7_to_9(prediction, bands_data, year=year)
+
+    # Smooth the classification to remove salt-and-pepper noise
+    display = median_filter(display.astype(np.int32), size=5).astype(np.int64)
+
+    unique2, counts2 = np.unique(display, return_counts=True)
+    print(f"Display classes (9-class): {dict(zip(unique2, counts2))}")
+
+    return display
+
+
+def compute_spectral_stats(year):
+    """Compute per-band and spectral index percentile distributions for a year's cached tiles."""
+    year_tile_dir = RAW_TILES_CACHE_DIR / str(year)
+    stats_path = year_tile_dir / 'spectral_stats_v2.json'
+
+    # Return cached stats if available
+    if stats_path.exists():
+        with open(stats_path, 'r') as f:
+            cached = json.load(f)
+        return {k: np.array(v) for k, v in cached.items()}
+
+    tiles = sorted(year_tile_dir.glob('tile_*.npy'))
+    if not tiles:
+        return None
+
+    # Collect raw values for all 9 bands
+    band_names = ['B2', 'B3', 'B4', 'B8', 'B11', 'B12', 'NDVI', 'NDWI', 'NDBI']
+    all_bands = {i: [] for i in range(9)}
+
+    for tp in tiles:
+        bands = np.load(tp)
+        # Skip ocean-dominated tiles
+        ndwi = bands[7].copy()
+        if np.abs(ndwi).max() > 1.5:
+            ndwi = np.clip(ndwi / 10000.0, -1, 1)
+        if np.mean(ndwi > 0.3) > 0.9:
+            continue
+        for i in range(9):
+            all_bands[i].append(bands[i].flatten())
+
+    percentile_points = np.linspace(0, 100, 1001)
+    result = {}
+    for i in range(9):
+        data = np.concatenate(all_bands[i])
+        result[f'band_{i}_percentiles'] = np.percentile(data, percentile_points)
+
+    with open(stats_path, 'w') as f:
+        json.dump({k: v.tolist() for k, v in result.items()}, f)
+    print(f"  Spectral stats (all 9 bands) computed and cached for {year}")
+    return result
+
+
+def build_normalization_lookup(source_percentiles, reference_percentiles):
+    """Build a quantile-mapping function from source to reference distribution."""
+    pct_axis = np.linspace(0, 100, len(source_percentiles))
+    def normalize(values):
+        ranks = np.interp(values, source_percentiles, pct_axis)
+        return np.interp(ranks, pct_axis, reference_percentiles)
+    return normalize
+
+
+def build_spectral_normalizers(year):
+    """Build normalizers that map any year's spectral values to 2019-equivalent values.
+    Only normalizes for years with different sensor/processing than 2019 (S2_SR_HARMONIZED).
+    2025 uses S2_SR_HARMONIZED -> no normalization needed."""
+
+    # Only normalize years with fundamentally different sensor data
+    # 2025 uses S2_SR_HARMONIZED -> no normalization needed
+    # 2015 uses S2 TOA -> needs normalization
+    # 2010 uses Landsat -> needs normalization
+    year_str = str(year)
+    needs_normalization = year_str in ('2010',)  # 2016 now uses S2_SR (2016-2018 window)
+    if not needs_normalization:
+        return None
+
+    ref_stats = compute_spectral_stats('2019')
+    if ref_stats is None:
+        print("  WARNING: No 2019 reference stats available, skipping normalization")
+        return None
+
+    year_stats = compute_spectral_stats(year)
+    if year_stats is None:
+        print(f"  WARNING: No spectral stats for {year}, skipping normalization")
+        return None
+
+    # Build per-band normalizers for all 9 bands
+    band_normalizers = []
+    for i in range(9):
+        src_key = f'band_{i}_percentiles'
+        ref_key = f'band_{i}_percentiles'
+        if src_key in year_stats and ref_key in ref_stats:
+            band_normalizers.append(build_normalization_lookup(year_stats[src_key], ref_stats[ref_key]))
+        else:
+            band_normalizers.append(None)
+
+    return {'bands': band_normalizers}
+
+
+def remap_7_to_9(prediction, bands_data, year='current'):
+    """
+    Remap 7-class model output to 9 display classes.
+
+    Uses spectral indices (NDVI, NDWI, NDBI) from bands_data to split
+    the model's coarse classes into finer land cover types.
+
+    Thresholds calibrated from spectral analysis of 195 Mauritius tiles.
+    2016 uses shifted thresholds to account for S2_SR vs S2_SR_HARMONIZED differences.
+
+    bands_data shape: (9, H, W) - B2, B3, B4, B8, B11, B12, NDVI, NDWI, NDBI
+    """
+    display = np.zeros_like(prediction)
+
+    # Extract spectral indices
+    ndvi = bands_data[6]
+    ndwi = bands_data[7]
+    ndbi = bands_data[8]
+    blue, green, red = bands_data[0], bands_data[1], bands_data[2]
+
+    # Normalize if in raw Sentinel-2 scale
+    if np.abs(ndvi).max() > 1.5:
+        ndvi = np.clip(ndvi / 10000.0, -1, 1)
+    if np.abs(ndwi).max() > 1.5:
+        ndwi = np.clip(ndwi / 10000.0, -1, 1)
+    if np.abs(ndbi).max() > 1.5:
+        ndbi = np.clip(ndbi / 10000.0, -1, 1)
+
+    # Brightness for cloud detection
+    b, g, r = blue.copy(), green.copy(), red.copy()
+    if b.max() > 100:
+        b, g, r = b / 10000.0, g / 10000.0, r / 10000.0
+    brightness = (b + g + r) / 3.0
+
+    # Year-specific thresholds: 2016 S2_SR has NDBI ~+0.06 higher, NDVI ~-0.2 lower vs 2019 S2_SR_HARMONIZED
+    year_str = str(year)
+    if year_str == '2016':
+        ndbi_urban = -0.02     # Urban cutoff (widened further to capture high-NDBI Wasteland as Plantation)
+        ndbi_forest = -0.26    # Forest cutoff (reverted, Forest was good at 26%)
+        ndbi_plant_lo = -0.32  # Plantation lower (widened to capture Wasteland pixels)
+        ndvi_forest2 = 0.25    # Forest NDVI for mod2 (was 0.4, shifted -0.15)
+        ndvi_forest3 = 0.35    # Forest NDVI for mod3 (was 0.5, shifted -0.15)
+        ndvi_plant = 0.08      # Plantation NDVI (lowered to capture more low-NDVI veg from Wasteland)
+        ndvi_urban = 0.25      # Urban NDVI cap (was 0.40, shifted -0.15)
+        ndvi_bare = 0.05       # Bare land NDVI (was 0.15, shifted -0.10)
+        ndvi_road = 0.05       # Road NDVI (was 0.15, shifted -0.10)
+        ndbi_road = 0.02       # Road NDBI (was -0.05, shifted +0.07)
+        ndvi_waste = 0.25      # Wasteland NDVI for mod4 (was 0.4, shifted -0.15)
+        ndbi_urban4 = -0.03    # Urban NDBI for mod4 (was -0.1, shifted +0.07)
+        ndvi_bg_veg = 0.15     # Background vegetation (was 0.3, shifted -0.15)
+    elif year_str == '2022':
+        ndbi_urban = -0.15
+        ndbi_forest = -0.31     # Slightly tighter than default to reduce Forest overcapture
+        ndbi_plant_lo = -0.32
+        ndvi_forest2 = 0.4
+        ndvi_forest3 = 0.5
+        ndvi_plant = 0.3
+        ndvi_urban = 0.40
+        ndvi_bare = 0.15
+        ndvi_road = 0.15
+        ndbi_road = -0.05
+        ndvi_waste = 0.4
+        ndbi_urban4 = -0.1
+        ndvi_bg_veg = 0.3
+    elif year_str == '2025':
+        ndbi_urban = -0.15
+        ndbi_forest = -0.31     # Tighter to push Forest to Plantation
+        ndbi_plant_lo = -0.33   # Wider to capture Wasteland as Plantation
+        ndvi_forest2 = 0.4
+        ndvi_forest3 = 0.5
+        ndvi_plant = 0.3
+        ndvi_urban = 0.40
+        ndvi_bare = 0.15
+        ndvi_road = 0.15
+        ndbi_road = -0.05
+        ndvi_waste = 0.4
+        ndbi_urban4 = -0.1
+        ndvi_bg_veg = 0.3
+    else:
+        ndbi_urban = -0.15
+        ndbi_forest = -0.30
+        ndbi_plant_lo = -0.32
+        ndvi_forest2 = 0.4
+        ndvi_forest3 = 0.5
+        ndvi_plant = 0.3
+        ndvi_urban = 0.40
+        ndvi_bare = 0.15
+        ndvi_road = 0.15
+        ndbi_road = -0.05
+        ndvi_waste = 0.4
+        ndbi_urban4 = -0.1
+        ndvi_bg_veg = 0.3
+
+    # ── Model class 0 (Background) → Bare Land / Clouds / Water ──
+    bg = prediction == 0
+    display[bg] = 6  # Default: Bare Land
+    display[bg & (brightness > 0.25) & (ndwi <= 0.0)] = 0    # Clouds (bright, not water)
+    display[bg & (ndwi > 0.15)] = 7                            # Ocean/water
+    display[bg & (ndwi > 0.0) & (ndwi <= 0.15)] = 1           # Shallow water
+    display[bg & (ndwi <= 0.0) & (brightness <= 0.25) & (ndvi >= ndvi_bg_veg)] = 8  # Vegetated bg → Wasteland
+
+    # ── Model class 1 (Water in model) → Display Water ──
+    display[prediction == 1] = 1
+
+    # ── Model class 2 (dominant vegetation, ~71% of land) ──
+    mod2 = prediction == 2
+    display[mod2] = 8  # Default: Wasteland (catch-all)
+    display[mod2 & (ndvi >= ndvi_plant) & (ndbi >= ndbi_plant_lo) & (ndbi < ndbi_urban)] = 3  # Plantation first
+    display[mod2 & (ndvi < ndvi_bare) & (ndbi < ndbi_urban)] = 6         # Bare Land
+    display[mod2 & (ndvi < ndvi_urban) & (ndbi >= ndbi_urban)] = 4        # Urban
+    display[mod2 & (ndvi >= ndvi_forest2) & (ndbi < ndbi_forest)] = 2     # Forest LAST (overrides Plantation)
+
+    # ── Model class 3 (moderate vegetation, ~19.5% of land) ──
+    mod3 = prediction == 3
+    display[mod3] = 8  # Default: Wasteland
+    display[mod3 & (ndvi >= ndvi_plant) & (ndbi >= ndbi_plant_lo) & (ndbi < ndbi_urban)] = 3  # Plantation first
+    display[mod3 & (ndvi < ndvi_urban) & (ndbi >= ndbi_urban)] = 4        # Urban
+    display[mod3 & (ndvi < ndvi_road) & (ndbi >= ndbi_road)] = 5          # Roads: very low NDVI + high NDBI
+    display[mod3 & (ndvi >= ndvi_forest3) & (ndbi < ndbi_forest)] = 2     # Forest LAST (overrides Plantation)
+
+    # ── Model class 4 (low/sparse vegetation, ~4.5% of land) → Roads ──
+    mod4 = prediction == 4
+    display[mod4] = 5  # Default: Roads
+    display[mod4 & (ndvi >= ndvi_waste)] = 8                       # High NDVI → actually Wasteland
+    display[mod4 & (ndbi >= ndbi_urban4)] = 4                      # High NDBI → Urban
+
+    # ── Model class 5 (Buildings) → Urban ──
+    display[prediction == 5] = 4
+
+    # ── Model class 6 (Bare Land) → Bare Land ──
+    display[prediction == 6] = 6
+
+    return display
+
+
+
+def create_colored_mask(prediction):
+    """Convert class indices to RGB"""
+    h, w = prediction.shape
+    colored = np.zeros((h, w, 3), dtype=np.uint8)
+
+    for class_id, info in CLASSES.items():
+        mask = prediction == class_id
+        colored[mask] = info['color']
+
+    return colored
+
+
+def get_class_statistics(prediction):
+    """Calculate land-only class distribution (exclude Clouds, Water, Ocean)"""
+    unique, counts = np.unique(prediction, return_counts=True)
+    count_map = dict(zip(unique, counts))
+
+    # Exclude non-land classes: Clouds(0), Water(1), Ocean(7)
+    excluded = {0, 1, 7}
+    land_pixels = sum(c for cid, c in count_map.items() if cid not in excluded and cid in CLASSES)
+
+    if land_pixels == 0:
+        land_pixels = 1  # Avoid division by zero
+
+    stats = []
+    for class_id, count in count_map.items():
+        if class_id in CLASSES and class_id not in excluded:
+            percentage = (count / land_pixels) * 100
+            stats.append({
+                'name': CLASSES[class_id]['name'],
+                'color': CLASSES[class_id]['color'],
+                'percentage': round(percentage, 2),
+                'pixels': int(count)
+            })
+
+    stats.sort(key=lambda x: x['percentage'], reverse=True)
+    return stats
+
+
+def array_to_base64(img_array):
+    """Convert numpy array to base64"""
+    img = Image.fromarray(img_array.astype(np.uint8))
+    buffer = io.BytesIO()
+    img.save(buffer, format='PNG')
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+# HTML Template
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Live Interactive Map - Mauritius Land Cover</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        *::-webkit-scrollbar { display: none; }
+        * { -ms-overflow-style: none; scrollbar-width: none; }
+        html, body {
+            overflow: hidden;
+            height: 100vh;
+            width: 100%;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            display: flex;
+            flex-direction: column;
+        }
+
+        #header {
+            background: linear-gradient(135deg, #2d5016 0%, #4a7c24 100%);
+            color: white;
+            padding: 15px 30px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+            z-index: 1000;
+            position: relative;
+        }
+
+        #header h1 {
+            font-size: 24px;
+            margin-bottom: 5px;
+        }
+
+        #header p {
+            font-size: 13px;
+            opacity: 0.95;
+        }
+
+        #info-bar {
+            background: #f8f9fa;
+            padding: 10px 30px;
+            border-bottom: 2px solid #e0e0e0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 20px;
+        }
+
+        #coordinates {
+            font-size: 14px;
+            font-weight: 500;
+            color: #333;
+        }
+
+        .year-selector-container {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .year-selector-container label {
+            font-size: 14px;
+            font-weight: 600;
+            color: #333;
+        }
+
+        #year-selector {
+            padding: 8px 15px;
+            font-size: 14px;
+            border: 2px solid #4a7c24;
+            border-radius: 8px;
+            background: white;
+            color: #333;
+            cursor: pointer;
+            font-weight: 500;
+            min-width: 180px;
+        }
+
+        #year-selector:hover {
+            border-color: #2d5016;
+            background: #f0f7e6;
+        }
+
+        #year-selector:focus {
+            outline: none;
+            box-shadow: 0 0 0 3px rgba(74, 124, 36, 0.2);
+        }
+
+        #status {
+            font-size: 13px;
+            padding: 5px 15px;
+            border-radius: 20px;
+            background: #e8f5e9;
+            color: #2e7d32;
+        }
+
+        #status.loading {
+            background: #fff3e0;
+            color: #f57c00;
+        }
+
+        #container {
+            display: grid;
+            grid-template-columns: minmax(200px, 300px) 1fr 1fr minmax(200px, 280px) minmax(250px, 1fr);
+            flex: 1;
+            min-height: 0;
+            gap: 0;
+            overflow: hidden;
+            border-bottom: 3px solid #ffffff;
+        }
+
+        #change-chart-container {
+            padding: 10px;
+        }
+
+        #change-chart-container canvas {
+            max-height: 250px;
+        }
+
+        .chart-title {
+            font-size: 13px;
+            font-weight: 600;
+            margin-bottom: 10px;
+            color: #333;
+        }
+
+        .mini-chart-box {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 6px;
+            border: 1px solid #e9ecef;
+        }
+
+        .historical-summary {
+            margin-top: 15px;
+            padding: 10px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            font-size: 12px;
+        }
+
+        .historical-summary h4 {
+            margin-bottom: 8px;
+            color: #2d5016;
+        }
+
+        .change-indicator {
+            display: flex;
+            justify-content: space-between;
+            padding: 4px 0;
+            border-bottom: 1px solid #eee;
+        }
+
+        .smart-city-tooltip {
+            font-size: 12px;
+            line-height: 1.4;
+            padding: 6px 10px;
+        }
+
+        .change-indicator:last-child {
+            border-bottom: none;
+        }
+
+        .change-positive {
+            color: #2e7d32;
+        }
+
+        .change-negative {
+            color: #c62828;
+        }
+
+        .panel {
+            background: white;
+            border-right: 1px solid #e0e0e0;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            overflow: hidden;
+        }
+
+        .panel:last-child {
+            border-right: none;
+        }
+
+        .panel-header {
+            padding: 15px 20px;
+            font-weight: 600;
+            font-size: 15px;
+            border-bottom: 2px solid #f0f0f0;
+            background: #fafafa;
+        }
+
+        .panel-content {
+            flex: 1;
+            overflow-y: auto;
+            overflow-x: hidden;
+            padding: 15px;
+            min-height: 0;
+        }
+
+        /* Hide scrollbar but keep scrollable */
+        .panel-content::-webkit-scrollbar {
+            width: 0;
+            display: none;
+        }
+        .panel-content {
+            -ms-overflow-style: none;
+            scrollbar-width: none;
+        }
+
+        #map {
+            height: 100%;
+            width: 100%;
+        }
+
+        #mauritius-map {
+            height: 100%;
+            width: 100%;
+            background-color: #a8d8ea;  /* Light blue for ocean */
+        }
+
+        .dual-image-container {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            height: 100%;
+            width: 100%;
+        }
+
+        .image-wrapper {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+        }
+
+        .image-label {
+            text-align: center;
+            font-size: 11px;
+            font-weight: 600;
+            color: #666;
+            padding: 3px 0;
+            background: #f5f5f5;
+            border-radius: 4px 4px 0 0;
+        }
+
+        .image-container {
+            text-align: center;
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #fafafa;
+            border-radius: 0 0 4px 4px;
+        }
+
+        .image-container img {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            border: 2px solid #e0e0e0;
+            border-radius: 4px;
+        }
+
+        .image-container {
+            min-height: 0;
+            overflow: hidden;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            margin: 12px 0;
+            padding: 10px 12px;
+            background: #f8f9fa;
+            border-radius: 6px;
+            transition: transform 0.2s;
+        }
+
+        .legend-item:hover {
+            transform: translateX(5px);
+            background: #e9ecef;
+        }
+
+        .legend-color {
+            width: 32px;
+            height: 32px;
+            border-radius: 6px;
+            margin-right: 15px;
+            border: 2px solid #ddd;
+        }
+
+        .legend-text {
+            flex: 1;
+            font-size: 14px;
+            font-weight: 500;
+        }
+
+        .legend-percentage, .legend-value {
+            font-weight: 700;
+            font-size: 14px;
+            color: #333;
+            min-width: 55px;
+            text-align: right;
+        }
+
+        .legend-bar-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .legend-bar-bg {
+            width: 100%;
+            height: 8px;
+            background: #e0e0e0;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .legend-bar {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.5s ease;
+        }
+
+        #loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            display: none;
+            z-index: 9999;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .loading-content {
+            background: white;
+            padding: 40px 60px;
+            border-radius: 12px;
+            text-align: center;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+        }
+
+        .spinner {
+            border: 5px solid #f3f3f3;
+            border-top: 5px solid #4CAF50;
+            border-radius: 50%;
+            width: 60px;
+            height: 60px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .loading-text {
+            font-size: 18px;
+            color: #333;
+            margin-bottom: 10px;
+        }
+
+        .loading-subtext {
+            font-size: 14px;
+            color: #666;
+        }
+
+        /* Responsive Design */
+        @media (max-width: 1600px) {
+            #container {
+                grid-template-columns: minmax(180px, 270px) 1fr 1fr minmax(180px, 220px) minmax(220px, 1fr);
+            }
+        }
+
+        @media (max-width: 1400px) {
+            #container {
+                grid-template-columns: minmax(170px, 250px) 1fr 1fr minmax(160px, 200px) minmax(200px, 1fr);
+            }
+
+            .panel-header {
+                padding: 12px 15px;
+                font-size: 14px;
+            }
+        }
+
+        @media (max-width: 1200px) {
+            #container {
+                grid-template-columns: minmax(160px, 220px) 1fr 1fr minmax(140px, 180px) minmax(180px, 1fr);
+            }
+
+            #header h1 {
+                font-size: 20px;
+            }
+
+            #info-bar {
+                padding: 8px 15px;
+                gap: 15px;
+            }
+
+            .legend-item {
+                margin: 6px 0;
+                padding: 6px 8px;
+            }
+
+            .legend-color {
+                width: 24px;
+                height: 24px;
+                margin-right: 10px;
+            }
+
+            .legend-text {
+                font-size: 12px;
+            }
+
+            .legend-percentage {
+                font-size: 12px;
+            }
+        }
+
+        @media (max-width: 1024px) {
+            #container {
+                grid-template-columns: 1fr 1fr;
+                grid-template-rows: auto auto auto auto;
+                height: calc(100vh - 120px);
+                overflow: hidden;
+            }
+
+            .panel {
+                border-right: none;
+                border-bottom: 1px solid #e0e0e0;
+            }
+
+            .panel:nth-child(1) { /* Satellite panel */
+                order: 3;
+                grid-column: 1;
+            }
+
+            .panel:nth-child(2) { /* Map panel */
+                order: 1;
+                grid-column: 1 / -1;
+            }
+
+            .panel:nth-child(3) { /* Mauritius Map panel */
+                order: 2;
+                grid-column: 1 / -1;
+            }
+
+            .panel:nth-child(4) { /* Legend panel */
+                order: 4;
+                grid-column: 2;
+            }
+
+            .panel:nth-child(5) { /* Historical panel */
+                order: 5;
+                grid-column: 1 / -1;
+            }
+
+            #header h1 {
+                font-size: 18px;
+            }
+
+            #info-bar {
+                flex-wrap: wrap;
+                gap: 10px;
+                padding: 10px 15px;
+            }
+        }
+
+        @media (max-width: 768px) {
+            #container {
+                grid-template-columns: 1fr;
+            }
+
+            .panel:nth-child(1),
+            .panel:nth-child(4),
+            .panel:nth-child(5) {
+                grid-column: 1;
+            }
+
+            .panel:nth-child(2) {
+                min-height: 0;
+            }
+
+            .panel:nth-child(3) {
+                min-height: 0;
+            }
+
+            #header {
+                padding: 12px 15px;
+            }
+
+            #header h1 {
+                font-size: 16px;
+                line-height: 1.3;
+            }
+
+            #header p {
+                font-size: 11px;
+            }
+
+            #info-bar {
+                flex-direction: column;
+                align-items: stretch;
+                gap: 8px;
+            }
+
+            .year-selector-container {
+                justify-content: space-between;
+            }
+
+            #year-selector {
+                min-width: 150px;
+            }
+
+            #status {
+                text-align: center;
+            }
+
+            .panel-header {
+                padding: 10px 12px;
+                font-size: 13px;
+            }
+
+            .panel-content {
+                padding: 10px;
+            }
+
+            .legend-item {
+                margin: 6px 0;
+                padding: 6px 8px;
+            }
+
+            .legend-color {
+                width: 20px;
+                height: 20px;
+                margin-right: 8px;
+            }
+
+            .legend-text {
+                font-size: 11px;
+            }
+
+            .legend-percentage {
+                font-size: 11px;
+                min-width: 40px;
+            }
+
+            .loading-content {
+                padding: 25px 30px;
+                margin: 15px;
+            }
+
+            .spinner {
+                width: 40px;
+                height: 40px;
+            }
+
+            .loading-text {
+                font-size: 16px;
+            }
+        }
+
+        @media (max-width: 480px) {
+            #header h1 {
+                font-size: 14px;
+            }
+
+            #header p {
+                font-size: 10px;
+            }
+
+            .panel:nth-child(2) {
+                min-height: 0;
+            }
+
+            .panel:nth-child(3) {
+                min-height: 0;
+            }
+
+            #year-selector {
+                min-width: 120px;
+                padding: 6px 10px;
+                font-size: 13px;
+            }
+
+            .year-selector-container label {
+                font-size: 12px;
+            }
+
+            .dual-image-container {
+                gap: 5px;
+            }
+
+            .image-label {
+                font-size: 10px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div id="header">
+        <h1>🇲🇺 Live Interactive Map - Mauritius Land Cover Classification</h1>
+        <p>Pan around the map to automatically fetch and classify Sentinel-2 imagery</p>
+    </div>
+
+    <div id="info-bar">
+        <div id="coordinates">Lat: --, Lon: --</div>
+        <div class="year-selector-container">
+            <label for="year-selector">Imagery Year:</label>
+            <select id="year-selector">
+                <option value="2025">2025</option>
+                <option value="2022">2022</option>
+                <option value="2019">2019</option>
+                <option value="2016">2016</option>
+                <option value="2010">2010 (Landsat)</option>
+            </select>
+        </div>
+        <div id="status">Ready</div>
+    </div>
+
+    <div id="loading-overlay">
+        <div class="loading-content">
+            <div class="spinner"></div>
+            <div class="loading-text">Fetching Sentinel-2 Imagery...</div>
+            <div class="loading-subtext">Downloading and classifying</div>
+        </div>
+    </div>
+
+    <div id="container">
+        <div class="panel">
+            <div class="panel-header">🗺️ Interactive Map</div>
+            <div class="panel-content" style="padding: 0;">
+                <div id="map"></div>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header">🛰️ Satellite Image & Classification</div>
+            <div class="panel-content">
+                <div class="dual-image-container">
+                    <div class="image-wrapper">
+                        <div class="image-label">Sentinel-2</div>
+                        <div class="image-container" id="satellite-container">
+                            <p style="color: #999;">Pan the map to load imagery</p>
+                        </div>
+                    </div>
+                    <div class="image-wrapper">
+                        <div class="image-label">Classification</div>
+                        <div class="image-container" id="classification-container">
+                            <p style="color: #999;">Classification will appear here</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header">🗺️ Mauritius Classification</div>
+            <div class="panel-content" style="padding: 0; position: relative;">
+                <div id="mauritius-map"></div>
+                <div id="mauritius-loading" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); display: none; background: rgba(255,255,255,0.9); padding: 15px 25px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); z-index: 1000;">
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <div class="spinner" style="width: 20px; height: 20px; border: 3px solid #f3f3f3; border-top: 3px solid #4a7c24; border-radius: 50%; animation: spin 1s linear infinite;"></div>
+                        <span>Classifying Mauritius...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header">📊 Class Distribution</div>
+            <div class="panel-content">
+                <div id="legend">
+                    <p style="color: #999;">Statistics will appear here</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header">📈 Historical Change Detection</div>
+            <div class="panel-content">
+                <div id="change-chart-container">
+                    <div style="margin-bottom: 8px; display: flex; flex-direction: column; gap: 4px;">
+                        <label style="font-size: 11px; cursor: pointer; display: inline-flex; align-items: center; gap: 5px;">
+                            <input type="checkbox" id="toggle-2016" checked style="cursor: pointer;">
+                            Include 2016 data
+                        </label>
+                        <label style="font-size: 11px; cursor: pointer; display: inline-flex; align-items: center; gap: 5px;">
+                            <input type="checkbox" id="toggle-2030" checked style="cursor: pointer;">
+                            Show 2030 Prediction
+                        </label>
+                        <label style="font-size: 11px; cursor: pointer; display: inline-flex; align-items: center; gap: 5px;">
+                            <input type="checkbox" id="toggle-ldn" checked style="cursor: pointer;">
+                            Show LDN 2030 Target
+                        </label>
+                        <hr style="margin: 4px 0; border: none; border-top: 1px solid #ddd;">
+                        <label style="font-size: 11px; cursor: pointer; display: inline-flex; align-items: center; gap: 5px;">
+                            <input type="checkbox" id="toggle-smartcities" style="cursor: pointer;">
+                            🏗️ Show Smart City Projects
+                        </label>
+                    </div>
+                    <div id="historical-summary" class="historical-summary">
+                        <p style="color: #999; font-size: 11px;">Loading historical data...</p>
+                    </div>
+                    <button id="load-historical-btn" style="display:none; margin-top: 10px; padding: 8px 16px; background: #4a7c24; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; width: 100%;">
+                        Load Historical Comparison
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Initialize map centered on Mauritius
+        const map = L.map('map', { attributionControl: false }).setView([{{ center_lat }}, {{ center_lon }}], 11);
+
+        // Add OpenStreetMap tiles
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap contributors',
+            maxZoom: 18
+        }).addTo(map);
+
+        // Add marker for current location
+        let marker = L.marker([{{ center_lat }}, {{ center_lon }}]).addTo(map);
+
+        let isLoading = false;
+        let lastFetchedLat = null;
+        let lastFetchedLon = null;
+        let lastFetchedYear = 'current';
+        let changeChart = null;
+        let historicalData = {};
+
+        // Class colors for chart
+        const classColors = {
+            'Water': 'rgba(168, 216, 234, 0.8)',
+            'Forest': 'rgba(34, 139, 34, 0.8)',
+            'Plantation': 'rgba(218, 165, 32, 0.8)',
+            'Urban': 'rgba(215, 204, 200, 0.8)',
+            'Roads': 'rgba(158, 158, 158, 0.8)',
+            'Bare Land': 'rgba(239, 235, 233, 0.8)',
+            'Clouds': 'rgba(255, 255, 255, 0.8)',
+            'Ocean': 'rgba(135, 190, 220, 0.8)',
+            'Wasteland': 'rgba(189, 183, 107, 0.8)'
+        };
+
+        // Initialize Mauritius overview map (no base map - classification only)
+        const mauritiusMap = L.map('mauritius-map', {
+            zoomControl: false,
+            attributionControl: false
+        }).setView([-20.25, 57.55], 10);
+
+        // Force map to recalculate size after DOM is ready
+        setTimeout(() => mauritiusMap.invalidateSize(), 100);
+
+        let mauritiusOverlay = null;
+        let currentMauritiusYear = null;
+
+        // Smart City Projects overlay
+        const smartCities = [
+            // Under construction (purple) - partially built
+            { name: 'Moka (Telfair)', lat: -20.2278, lon: 57.5078, ha: 182, built: true, pctBuilt: '~45%' },
+            { name: 'Médine (Uniciti)', lat: -20.2789, lon: 57.4070, ha: 347, built: true, pctBuilt: '~18%' },
+            { name: 'Beau Plan', lat: -20.0980, lon: 57.5750, ha: 230, built: true, pctBuilt: '~22%' },
+            { name: 'Azuri', lat: -20.0969, lon: 57.6981, ha: 170, built: true, pctBuilt: '14%' },
+            { name: 'Cap Tamarin', lat: -20.3280, lon: 57.3780, ha: 44, built: true, pctBuilt: '~25%' },
+            { name: 'Mon Trésor', lat: -20.4350, lon: 57.6650, ha: 400, built: true, pctBuilt: '~15%' },
+            { name: 'Jin Fei (Riche Terre)', lat: -20.1380, lon: 57.5300, ha: 137, built: true, pctBuilt: '~12%' },
+            // Not yet built (red) - planned/early stage
+            { name: 'Curzon (Le Bouchon)', lat: -20.4683, lon: 57.6808, ha: 152, built: false, pctBuilt: '0%' },
+            { name: 'Anahita Beau Champ', lat: -20.2500, lon: 57.7800, ha: 118, built: false, pctBuilt: '~3%' },
+        ];
+
+        // Mauritius total land area in hectares
+        const TOTAL_LAND_HA = 185900;
+        let smartCityLayers = [];
+
+        function toggleSmartCities(show) {
+            if (show) {
+                smartCities.forEach(sc => {
+                    const radius = Math.sqrt(sc.ha * 10000 / Math.PI);
+                    const color = sc.built ? '#9C27B0' : '#D32F2F';
+                    const fillColor = sc.built ? '#CE93D8' : '#EF9A9A';
+                    const pctLand = (sc.ha / TOTAL_LAND_HA * 100).toFixed(2);
+
+                    const circle = L.circle([sc.lat, sc.lon], {
+                        radius: radius,
+                        color: color,
+                        weight: 3,
+                        fillColor: fillColor,
+                        fillOpacity: 0.7,
+                        dashArray: sc.built ? null : '6,4'
+                    }).addTo(mauritiusMap);
+
+                    circle.bindTooltip(
+                        `<b>${sc.name}</b><br>` +
+                        `${sc.ha} ha (${pctLand}% of island)<br>` +
+                        `<span style="color:${color}">${sc.built ? '🟣 Under construction' : '🔴 Planned'}</span>`,
+                        { sticky: true, className: 'smart-city-tooltip' }
+                    );
+
+                    smartCityLayers.push(circle);
+                });
+            } else {
+                smartCityLayers.forEach(layer => mauritiusMap.removeLayer(layer));
+                smartCityLayers = [];
+            }
+        }
+
+        document.getElementById('toggle-smartcities').addEventListener('change', function() {
+            toggleSmartCities(this.checked);
+        });
+
+        // Function to load full island classification
+        async function loadMauritiusClassification(year, force = false) {
+            console.log('loadMauritiusClassification called with year:', year, 'current:', currentMauritiusYear, 'force:', force);
+
+            if (!force && currentMauritiusYear === year) {
+                console.log('Skipping - already loaded year:', year);
+                return;
+            }
+
+            document.getElementById('mauritius-loading').style.display = 'block';
+
+            try {
+                console.log('Fetching classification for year:', year);
+                const response = await fetch('/api/classify_mauritius', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ year: year })
+                });
+
+                const data = await response.json();
+
+                // If server says classification is already running, poll for it
+                if (response.status === 202 && data.status === 'in_progress') {
+                    console.log('Classification already in progress, polling...');
+                    pollForCompletion(year);
+                    return;
+                }
+
+                console.log('Received data for year:', year, 'statistics:', data.statistics);
+
+                if (data.classification_image) {
+                    // Remove old overlay
+                    if (mauritiusOverlay) {
+                        mauritiusMap.removeLayer(mauritiusOverlay);
+                    }
+
+                    // Add new classification overlay
+                    const bounds = [
+                        [data.bounds.south, data.bounds.west],
+                        [data.bounds.north, data.bounds.east]
+                    ];
+
+                    mauritiusOverlay = L.imageOverlay(
+                        'data:image/png;base64,' + data.classification_image,
+                        bounds,
+                        { opacity: 1.0 }
+                    ).addTo(mauritiusMap);
+
+                    currentMauritiusYear = year;
+
+                    // Update Class Distribution panel with island-wide stats
+                    if (data.statistics) {
+                        console.log('Updating legend with statistics:', data.statistics);
+                        updateIslandLegend(data.statistics, year);
+                    }
+
+                    // Store for historical comparison
+                    historicalData[year] = data.statistics;
+                }
+            } catch (error) {
+                console.error('Error loading Mauritius classification:', error);
+            }
+
+            document.getElementById('mauritius-loading').style.display = 'none';
+        }
+
+        // Function to update legend with island-wide statistics
+        function updateIslandLegend(statistics, year) {
+            const legendDiv = document.getElementById('legend');
+            const yearLabel = year === 'current' ? 'Current' : year;
+
+            // Filter out Clouds, Water, and Ocean (show land classes only), sort by percentage descending
+            const landStats = statistics
+                .filter(stat => stat.class !== 'Clouds' && stat.class !== 'Water' && stat.class !== 'Ocean')
+                .sort((a, b) => b.percentage - a.percentage);
+
+            // Find max percentage for bar scaling (so largest bar is 100% width)
+            const maxPercentage = Math.max(...landStats.map(s => s.percentage));
+
+            let html = `<div style="font-size: 12px; color: #333; margin-bottom: 12px; text-align: center; font-weight: 600;">🏝️ Mauritius Land Cover</div>`;
+            html += `<div style="font-size: 10px; color: #888; margin-bottom: 15px; text-align: center;">${yearLabel} Classification</div>`;
+
+            landStats.forEach(stat => {
+                const color = classColors[stat.class] || 'rgba(200,200,200,0.8)';
+                const rgbColor = color.replace('0.8)', '1)');
+                const barColor = color.replace('rgba', 'rgb').replace(', 0.8)', ')');
+                // Scale bar width relative to max, so bars are visible
+                const barWidth = (stat.percentage / maxPercentage) * 100;
+                html += `
+                    <div class="legend-item" style="flex-direction: column; align-items: stretch; padding: 8px 12px;">
+                        <div style="display: flex; align-items: center; margin-bottom: 6px;">
+                            <div class="legend-color" style="background: ${rgbColor}; width: 24px; height: 24px; margin-right: 10px;"></div>
+                            <div class="legend-text" style="flex: 1;">${stat.class}</div>
+                            <div class="legend-value">${stat.percentage.toFixed(1)}%</div>
+                        </div>
+                        <div class="legend-bar-bg">
+                            <div class="legend-bar" style="width: ${barWidth}%; background: ${barColor};"></div>
+                        </div>
+                    </div>
+                `;
+            });
+
+            legendDiv.innerHTML = html;
+        }
+
+        // Load initial classification - check if already in progress first
+        setTimeout(async () => {
+            const initialYear = document.getElementById('year-selector').value;
+            // Check if server already has a classification running
+            const statusResp = await fetch('/api/classification_status');
+            const statusData = await statusResp.json();
+            if (statusData[initialYear]) {
+                // Already running - show spinner and poll for completion
+                document.getElementById('mauritius-loading').style.display = 'block';
+                pollForCompletion(initialYear);
+            } else {
+                loadMauritiusClassification(initialYear, true);
+            }
+        }, 1000);
+
+        // Poll server every 5s until classification completes, then load result
+        async function pollForCompletion(year) {
+            const statusResp = await fetch('/api/classification_status');
+            const statusData = await statusResp.json();
+            if (statusData[year]) {
+                const p = statusData[year];
+                const pct = p.tiles_total > 0 ? Math.round(p.tiles_done / p.tiles_total * 100) : 0;
+                const loadingEl = document.getElementById('mauritius-loading');
+                if (loadingEl) loadingEl.innerHTML = `<span style="font-size:1.5em">&#9685;</span> Classifying Mauritius... ${pct}% (${p.tiles_done}/${p.tiles_total} tiles)`;
+                setTimeout(() => pollForCompletion(year), 5000);
+            } else {
+                // Done - load the result
+                document.getElementById('mauritius-loading').style.display = 'none';
+                loadMauritiusClassification(year, true);
+            }
+        }
+
+        // Function to fetch and classify
+        function fetchAndClassify(lat, lon, forceRefresh = false) {
+            const selectedYear = document.getElementById('year-selector').value;
+
+            // Don't fetch if already loading
+            if (isLoading) return;
+
+            // Don't fetch if coordinates and year haven't changed much
+            if (!forceRefresh && lastFetchedLat !== null && lastFetchedLon !== null) {
+                const latDiff = Math.abs(lat - lastFetchedLat);
+                const lonDiff = Math.abs(lon - lastFetchedLon);
+                if (latDiff < 0.01 && lonDiff < 0.01 && selectedYear === lastFetchedYear) {
+                    return;
+                }
+            }
+
+            isLoading = true;
+            lastFetchedLat = lat;
+            lastFetchedLon = lon;
+            lastFetchedYear = selectedYear;
+
+            // Update UI
+            document.getElementById('coordinates').textContent =
+                `Lat: ${lat.toFixed(4)}, Lon: ${lon.toFixed(4)}`;
+            document.getElementById('status').textContent = 'Fetching ' + (selectedYear === 'current' ? 'current' : selectedYear) + ' imagery...';
+            document.getElementById('status').className = 'loading';
+            document.getElementById('loading-overlay').style.display = 'flex';
+
+            // Update loading text
+            const satellite = ['2010', '2013'].includes(selectedYear) ? 'Landsat' : 'Sentinel-2';
+            document.querySelector('.loading-text').textContent = `Fetching ${satellite} ${selectedYear === 'current' ? '' : selectedYear} Imagery...`;
+
+            // Update marker
+            marker.setLatLng([lat, lon]);
+
+            // Fetch from backend with year parameter
+            fetch('/api/classify_location', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ lat, lon, year: selectedYear })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+
+                // Update panel header to show satellite type
+                const panelHeader = document.querySelector('.panel:nth-child(2) .panel-header');
+                if (['2010', '2013'].includes(selectedYear)) {
+                    panelHeader.textContent = '🛰️ Landsat ' + selectedYear + ' Satellite Image';
+                } else if (selectedYear === 'current') {
+                    panelHeader.textContent = '🛰️ Sentinel-2 Satellite Image (Current)';
+                } else {
+                    panelHeader.textContent = '🛰️ Sentinel-2 ' + selectedYear + ' Satellite Image';
+                }
+
+                // Update images
+                document.getElementById('satellite-container').innerHTML =
+                    '<img src="data:image/png;base64,' + data.satellite + '" alt="Satellite">';
+
+                document.getElementById('classification-container').innerHTML =
+                    '<img src="data:image/png;base64,' + data.classification + '" alt="Classification">';
+
+                // Store statistics for historical comparison (don't update legend - keep island-wide stats)
+                historicalData[selectedYear] = data.statistics;
+
+                // Update status
+                document.getElementById('status').textContent = 'Ready';
+                document.getElementById('status').className = '';
+                document.getElementById('loading-overlay').style.display = 'none';
+                isLoading = false;
+            })
+            .catch(err => {
+                console.error(err);
+                document.getElementById('status').textContent = 'Error: ' + err.message;
+                document.getElementById('status').className = '';
+                document.getElementById('loading-overlay').style.display = 'none';
+                isLoading = false;
+            });
+        }
+
+        // Year selector change handler
+        document.getElementById('year-selector').addEventListener('change', function() {
+            const selectedYear = this.value;
+            console.log('Year selector changed to:', selectedYear);
+            // Update local tile classification
+            if (lastFetchedLat !== null && lastFetchedLon !== null) {
+                fetchAndClassify(lastFetchedLat, lastFetchedLon, true);
+            }
+            // Update full island classification - force reload
+            loadMauritiusClassification(selectedYear, true);
+        });
+
+        // Auto-load historical chart from cached full-island stats
+        function loadCachedHistoricalChart() {
+            fetch('/api/cached_historical_stats')
+            .then(r => r.json())
+            .then(data => {
+                if (data.error || !data.statistics || Object.keys(data.statistics).length === 0) {
+                    document.getElementById('load-historical-btn').style.display = 'block';
+                    return;
+                }
+                document.getElementById('load-historical-btn').style.display = 'none';
+                updateChangeChart(data);
+                updateHistoricalSummary(data);
+            })
+            .catch(err => {
+                console.error('Failed to load cached stats:', err);
+                document.getElementById('load-historical-btn').style.display = 'block';
+            });
+        }
+
+        // Load chart on page load
+        setTimeout(loadCachedHistoricalChart, 500);
+
+        // Store cached data for toggle re-render
+        let cachedHistoricalData = null;
+
+        function updateChangeChart(data) {
+            // No chart needed - table only
+        }
+
+        // Toggle handlers
+        ['toggle-2016', 'toggle-2030', 'toggle-ldn'].forEach(id => {
+            document.getElementById(id).addEventListener('change', function() {
+                if (cachedHistoricalData) {
+                    updateHistoricalSummary(cachedHistoricalData);
+                }
+            });
+        });
+
+        // Linear regression: returns {slope, intercept}
+        function linearRegression(xs, ys) {
+            const n = xs.length;
+            const sumX = xs.reduce((a, b) => a + b, 0);
+            const sumY = ys.reduce((a, b) => a + b, 0);
+            const sumXY = xs.reduce((a, x, i) => a + x * ys[i], 0);
+            const sumX2 = xs.reduce((a, x) => a + x * x, 0);
+            const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+            const intercept = (sumY - slope * sumX) / n;
+            return { slope, intercept };
+        }
+
+        // Update historical summary as a table
+        function updateHistoricalSummary(data) {
+            cachedHistoricalData = data;
+            const include2016 = document.getElementById('toggle-2016').checked;
+            const show2030 = document.getElementById('toggle-2030').checked;
+            const showLdn = document.getElementById('toggle-ldn').checked;
+            let years = Object.keys(data.statistics).sort();
+            if (!include2016) {
+                years = years.filter(y => y !== '2016');
+            }
+            const firstYear = years[0];
+            const lastYear = years[years.length - 1];
+            const classes = ['Plantation', 'Forest', 'Wasteland', 'Urban', 'Bare Land', 'Roads'];
+
+            // Calculate 2030 predictions using linear regression
+            const predictions2030 = {};
+            classes.forEach(className => {
+                const xs = [];
+                const ys = [];
+                years.forEach(year => {
+                    const yearStats = data.statistics[year];
+                    const stat = yearStats.find(s => s.name === className || s.class === className);
+                    if (stat) {
+                        xs.push(parseInt(year));
+                        ys.push(stat.percentage);
+                    }
+                });
+                if (xs.length >= 2) {
+                    const reg = linearRegression(xs, ys);
+                    predictions2030[className] = Math.max(0, reg.slope * 2030 + reg.intercept);
+                }
+            });
+
+            // Normalize predictions to sum to ~100%
+            const predTotal = Object.values(predictions2030).reduce((a, b) => a + b, 0);
+            if (predTotal > 0) {
+                Object.keys(predictions2030).forEach(k => {
+                    predictions2030[k] = predictions2030[k] / predTotal * 100;
+                });
+            }
+
+            // LDN 2030 targets (official Mauritius UNCCD submission)
+            // Total land area: 185,900 ha
+            const ldnTargets = {
+                'Plantation': 38.3,  // 71,182 ha agricultural land target
+                'Forest': 28.1,      // 52,290 ha forest cover target
+                'Urban': 23.8,       // 44,283 ha urban artificial areas
+                'Wasteland': 7.5,    // remaining after other targets
+                'Bare Land': 2.0,
+                'Roads': 0.3
+            };
+
+            let summaryHtml = `
+                <table style="width:100%; border-collapse:collapse; font-size:11px;">
+                    <thead>
+                        <tr style="border-bottom:2px solid #ddd;">
+                            <th style="text-align:left; padding:5px 3px;">Class</th>`;
+            years.forEach(y => {
+                summaryHtml += `<th style="text-align:center; padding:5px 3px;">${y}</th>`;
+            });
+            if (show2030) summaryHtml += `<th style="text-align:center; padding:5px 3px; color:#1565C0; border-left:2px solid #1565C0;">2030</th>`;
+            if (showLdn) summaryHtml += `<th style="text-align:center; padding:5px 3px; color:#E65100; border-left:2px solid #E65100;">LDN</th>`;
+            summaryHtml += `<th style="text-align:center; padding:5px 3px;">Change</th></tr></thead><tbody>`;
+
+            classes.forEach(className => {
+                summaryHtml += `<tr style="border-bottom:1px solid #eee;"><td style="padding:4px 3px; font-weight:500;">${className}</td>`;
+                let firstVal = null, lastVal = null;
+                years.forEach(year => {
+                    const yearStats = data.statistics[year];
+                    const stat = yearStats.find(s => s.name === className || s.class === className);
+                    const val = stat ? stat.percentage : 0;
+                    if (firstVal === null) firstVal = val;
+                    lastVal = val;
+                    summaryHtml += `<td style="text-align:center; padding:4px 3px;">${val.toFixed(1)}%</td>`;
+                });
+                // 2030 prediction
+                const pred = predictions2030[className] || 0;
+                if (show2030) summaryHtml += `<td style="text-align:center; padding:4px 3px; color:#1565C0; font-weight:600; border-left:2px solid #1565C0;">${pred.toFixed(1)}%</td>`;
+                // LDN target
+                const ldn = ldnTargets[className] || 0;
+                if (showLdn) summaryHtml += `<td style="text-align:center; padding:4px 3px; color:#E65100; font-weight:600; border-left:2px solid #E65100;">${ldn.toFixed(1)}%</td>`;
+                // Change: from first year to 2030 predicted (if shown) or last actual year
+                const endVal = show2030 ? pred : lastVal;
+                const change = firstVal > 0 ? ((endVal - firstVal) / firstVal * 100).toFixed(1) : '0.0';
+                const color = parseFloat(change) >= 0 ? '#4CAF50' : '#f44336';
+                const arrow = parseFloat(change) >= 0 ? '↑' : '↓';
+                summaryHtml += `<td style="text-align:center; padding:4px 3px; color:${color}; font-weight:600;">${arrow}${Math.abs(parseFloat(change))}%</td></tr>`;
+            });
+
+            summaryHtml += `</tbody></table>`;
+            if (show2030) summaryHtml += `<p style="font-size:10px; color:#999; margin-top:6px;">2030: predicted via linear regression (${firstYear}-${lastYear})</p>`;
+            if (showLdn) summaryHtml += `<p style="font-size:10px; color:#999; margin-top:${show2030 ? '2' : '6'}px;">LDN: Land Degradation Neutrality targets (Mauritius UNCCD 2030)</p>`;
+            if (!show2030) summaryHtml += `<p style="font-size:10px; color:#999; margin-top:6px;">Change: ${firstYear} → ${lastYear}</p>`;
+            document.getElementById('historical-summary').innerHTML = summaryHtml;
+        }
+
+        // Fetch on map move end (after pan/zoom)
+        map.on('moveend', function() {
+            const center = map.getCenter();
+            fetchAndClassify(center.lat, center.lng);
+        });
+
+        // Fetch on click
+        map.on('click', function(e) {
+            fetchAndClassify(e.latlng.lat, e.latlng.lng, true);
+        });
+
+        // Initial fetch
+        setTimeout(() => {
+            fetchAndClassify({{ center_lat }}, {{ center_lon }});
+        }, 1000);
+    </script>
+</body>
+</html>
+'''
+
+
+@app.route('/')
+def index():
+    """Main page"""
+    return render_template_string(
+        HTML_TEMPLATE,
+        center_lat=MAURITIUS_BOUNDS['center_lat'],
+        center_lon=MAURITIUS_BOUNDS['center_lon']
+    )
+
+
+@app.route('/api/classify_location', methods=['POST'])
+def classify_location():
+    """Classify satellite imagery for location using cached raw tiles (no GEE download).
+    Loads a 2x2 block of tiles around the click point, classifies each independently,
+    then stitches into a 512x512 image for display.
+    """
+    try:
+        data = request.get_json()
+        lat = data.get('lat')
+        lon = data.get('lon')
+        year = data.get('year', 'current')
+
+        print(f"Classifying location: {lat:.4f}, {lon:.4f} for year: {year}")
+
+        bounds = MAURITIUS_BOUNDS_FULL
+        n_rows, n_cols = 15, 13
+        step_lat = (bounds['north'] - bounds['south']) / n_rows
+        step_lon = (bounds['east'] - bounds['west']) / n_cols
+
+        # Find which tile the click falls in
+        row_f = (lat - bounds['south']) / step_lat
+        col_f = (lon - bounds['west']) / step_lon
+        center_row = int(row_f)
+        center_col = int(col_f)
+        center_row = max(0, min(n_rows - 1, center_row))
+        center_col = max(0, min(n_cols - 1, center_col))
+
+        # Determine 2x2 block: pick the tile containing the click + neighbors
+        # based on which quadrant of the tile the click is in
+        frac_row = row_f - center_row  # 0-1 within tile
+        frac_col = col_f - center_col
+        # If click is in upper half of tile, pair with tile above; else below
+        if frac_row >= 0.5 and center_row < n_rows - 1:
+            row_lo, row_hi = center_row, center_row + 1
+        else:
+            row_lo, row_hi = max(0, center_row - 1), center_row
+        # If click is in right half, pair with tile to the right; else left
+        if frac_col >= 0.5 and center_col < n_cols - 1:
+            col_lo, col_hi = center_col, center_col + 1
+        else:
+            col_lo, col_hi = max(0, center_col - 1), center_col
+
+        year_tile_dir = RAW_TILES_CACHE_DIR / str(year)
+        tile_size = 256
+        has_tiles = year_tile_dir.exists()
+
+        if has_tiles:
+            spectral_normalizers = build_spectral_normalizers(year)
+
+            # Load and classify each tile in the 2x2 block
+            rgb_grid = np.zeros((tile_size * 2, tile_size * 2, 3), dtype=np.uint8)
+            cls_grid = np.zeros((tile_size * 2, tile_size * 2, 3), dtype=np.uint8)
+            pred_grid = np.zeros((tile_size * 2, tile_size * 2), dtype=np.uint8)
+            tiles_loaded = 0
+
+            for gi, r in enumerate([row_hi, row_lo]):  # top=north(hi), bottom=south(lo)
+                for gj, c in enumerate([col_lo, col_hi]):  # left=west(lo), right=east(hi)
+                    tile_path = year_tile_dir / f"tile_{r:02d}_{c:02d}.npy"
+                    y0 = gi * tile_size
+                    x0 = gj * tile_size
+
+                    if tile_path.exists():
+                        bands_data = np.load(tile_path)
+                        tiles_loaded += 1
+
+                        # RGB
+                        rgb = np.stack([bands_data[2], bands_data[1], bands_data[0]], axis=-1)
+                        rgb = np.clip(rgb / 3000 * 255, 0, 255).astype(np.uint8)
+                        rgb_grid[y0:y0+tile_size, x0:x0+tile_size] = rgb
+
+                        # Classify
+                        prediction = classify_image(bands_data, year=year, spectral_normalizers=spectral_normalizers)
+                        cls_colored = create_colored_mask(prediction)
+                        cls_grid[y0:y0+tile_size, x0:x0+tile_size] = cls_colored
+                        pred_grid[y0:y0+tile_size, x0:x0+tile_size] = prediction
+
+            print(f"  Loaded {tiles_loaded}/4 tiles: rows [{row_lo},{row_hi}] cols [{col_lo},{col_hi}]")
+
+            statistics = get_class_statistics(pred_grid)
+            satellite_b64 = array_to_base64(rgb_grid)
+            classification_b64 = array_to_base64(cls_grid)
+        else:
+            # No cached tiles — fall back to GEE download
+            print(f"  No cached tiles, downloading from GEE...")
+            image_data = download_imagery_for_year(lat, lon, year)
+            bands_data = image_data['bands_data']
+            spectral_normalizers = build_spectral_normalizers(year)
+            prediction = classify_image(bands_data, year=year, spectral_normalizers=spectral_normalizers)
+            classification_colored = create_colored_mask(prediction)
+            statistics = get_class_statistics(prediction)
+            satellite_b64 = array_to_base64(image_data['rgb_image'])
+            classification_b64 = array_to_base64(classification_colored)
+
+        print(f"  Classification complete (cached tiles)")
+
+        return jsonify({
+            'satellite': satellite_b64,
+            'classification': classification_b64,
+            'statistics': statistics,
+            'year': year
+        })
+
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/historical_comparison', methods=['POST'])
+def historical_comparison():
+    """Get land cover statistics for multiple years for comparison"""
+    try:
+        data = request.get_json()
+        lat = data.get('lat')
+        lon = data.get('lon')
+        years = data.get('years', ['2010', '2016', '2022', 'current'])
+
+        print(f"\n{'='*60}")
+        print(f"Historical comparison for: {lat:.4f}, {lon:.4f}")
+        print(f"Years: {years}")
+
+        all_statistics = {}
+
+        for year in years:
+            print(f"Processing {year}...")
+            try:
+                # Download imagery for this year
+                image_data = download_imagery_for_year(lat, lon, year)
+
+                # Classify (pass year for correct NDVI thresholds)
+                prediction = classify_image(image_data['bands_data'], year=year)
+
+                # Get statistics
+                statistics = get_class_statistics(prediction)
+
+                all_statistics[year] = statistics
+                print(f"  {year} complete")
+
+            except Exception as e:
+                print(f"  Error for {year}: {e}")
+                all_statistics[year] = []
+
+        print(f"Historical comparison complete!")
+        print(f"{'='*60}\n")
+
+        return jsonify({
+            'statistics': all_statistics,
+            'location': {'lat': lat, 'lon': lon}
+        })
+
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/cached_historical_stats')
+def cached_historical_stats():
+    """Return cached full-island classification stats for all available years"""
+    try:
+        stats = {}
+        for year in ['2016', '2019', '2022', '2025']:
+            stats_path = CLASSIFICATION_CACHE_DIR / f'mauritius_{year}_stats.json'
+            if stats_path.exists():
+                with open(stats_path, 'r') as f:
+                    data = json.load(f)
+                stats[year] = data.get('statistics', [])
+        return jsonify({'statistics': stats})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# Directory for cached full-island classification images
+CLASSIFICATION_CACHE_DIR = Path('data/classification_cache')
+CLASSIFICATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Directory for cached raw satellite tile data (never re-downloaded)
+RAW_TILES_CACHE_DIR = CLASSIFICATION_CACHE_DIR / 'raw_tiles'
+RAW_TILES_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Mauritius bounding box (constant)
+MAURITIUS_BOUNDS_FULL = {
+    'north': -19.98,
+    'south': -20.52,
+    'west': 57.30,
+    'east': 57.80
+}
+
+
+def get_cached_classification_path(year):
+    """Get file paths for cached classification data"""
+    return {
+        'image': CLASSIFICATION_CACHE_DIR / f'mauritius_{year}.png',
+        'stats': CLASSIFICATION_CACHE_DIR / f'mauritius_{year}_stats.json'
+    }
+
+
+def load_cached_classification(year):
+    """Load classification from disk if it exists"""
+    paths = get_cached_classification_path(year)
+
+    if paths['image'].exists() and paths['stats'].exists():
+        print(f"Loading cached classification for {year} from disk")
+
+        # Load image as base64
+        with open(paths['image'], 'rb') as f:
+            classification_b64 = base64.b64encode(f.read()).decode()
+
+        # Load statistics
+        with open(paths['stats'], 'r') as f:
+            stats_data = json.load(f)
+
+        return {
+            'classification_image': classification_b64,
+            'bounds': MAURITIUS_BOUNDS_FULL,
+            'statistics': stats_data['statistics'],
+            'year': year
+        }
+
+    return None
+
+
+def save_classification_to_cache(year, image_data, statistics):
+    """Save classification image and stats to disk"""
+    paths = get_cached_classification_path(year)
+
+    # Save image
+    image_bytes = base64.b64decode(image_data)
+    with open(paths['image'], 'wb') as f:
+        f.write(image_bytes)
+
+    # Save statistics
+    with open(paths['stats'], 'w') as f:
+        json.dump({'statistics': statistics, 'year': year}, f)
+
+    print(f"Saved classification for {year} to {paths['image']}")
+
+
+@app.route('/api/classification_status', methods=['GET'])
+def classification_status():
+    """Return current classification progress for all in-progress years."""
+    return jsonify(CLASSIFICATION_IN_PROGRESS)
+
+
+@app.route('/api/classify_mauritius', methods=['POST'])
+def classify_mauritius():
+    """
+    Classify the full island of Mauritius using hierarchical mosaic approach.
+
+    The key insight: each 256x256 tile represents exactly 2km x 2km.
+    We create a grid where each cell is 2km, download/classify each cell,
+    then assemble them in the correct geographic order.
+    """
+    try:
+        data = request.get_json()
+        year = data.get('year', 'current')
+        force_reclassify = data.get('force_reclassify', False)
+
+        # Check disk cache first (skip if force reclassify requested)
+        if not force_reclassify:
+            cached = load_cached_classification(year)
+            if cached:
+                print(f"Using CACHED classification for {year} - skipping re-run")
+                return jsonify(cached)
+
+        # If already running for this year, return progress instead of restarting
+        if year in CLASSIFICATION_IN_PROGRESS and not force_reclassify:
+            progress = CLASSIFICATION_IN_PROGRESS[year]
+            print(f"Classification for {year} already in progress: {progress['tiles_done']}/{progress['tiles_total']}")
+            return jsonify({'status': 'in_progress', 'progress': progress}), 202
+
+        print(f"\n{'='*60}")
+        print(f"Full Mauritius classification for year: {year}")
+        print(f"Using mosaic approach (2km tiles)...")
+
+        bounds = MAURITIUS_BOUNDS_FULL
+
+        # Each 256x256 tile = 2km x 2km
+        # Convert 2km to degrees at Mauritius latitude (~-20.25)
+        km_per_deg_lat = 111.0
+        km_per_deg_lon = 111.0 * np.cos(np.radians(20.25))  # ~104 km/deg
+
+        tile_size_km = 2.0
+        tile_deg_lat = tile_size_km / km_per_deg_lat  # ~0.018 deg
+        tile_deg_lon = tile_size_km / km_per_deg_lon  # ~0.019 deg
+
+        # Calculate grid dimensions
+        lat_range = bounds['north'] - bounds['south']  # ~0.54 deg = ~60km
+        lon_range = bounds['east'] - bounds['west']    # ~0.50 deg = ~52km
+
+        # Use a fixed grid size - since we cache the result, processing time is okay
+        # 15x13 grid gives good coverage (~195 tiles, will take ~15-20 min first time)
+        n_rows = 15  # covers ~60km with ~4km per tile
+        n_cols = 13  # covers ~52km with ~4km per tile
+
+        # Calculate step size and tile size to match
+        step_lat = lat_range / n_rows
+        step_lon = lon_range / n_cols
+
+        # Each tile should cover exactly one grid cell
+        # Convert step degrees to km for download
+        tile_size_km_lat = step_lat * km_per_deg_lat  # ~4km
+        tile_size_km_lon = step_lon * km_per_deg_lon  # ~4km
+        tile_size_km = max(tile_size_km_lat, tile_size_km_lon)  # Use larger to ensure coverage
+
+        print(f"  Grid: {n_rows} rows x {n_cols} cols = {n_rows * n_cols} tiles")
+        print(f"  Step: {step_lat:.4f} deg lat, {step_lon:.4f} deg lon")
+        print(f"  Tile size: {tile_size_km:.1f} km (to cover each grid cell)")
+
+        # Create composite array
+        composite_h = 256 * n_rows
+        composite_w = 256 * n_cols
+        composite = np.zeros((composite_h, composite_w), dtype=np.uint8)
+
+        total_statistics = {}
+        valid_tiles = 0
+
+        # Raw tile cache for this year
+        year_tile_dir = RAW_TILES_CACHE_DIR / str(year)
+        year_tile_dir.mkdir(parents=True, exist_ok=True)
+
+        # Register as in-progress to prevent duplicate runs on page refresh
+        CLASSIFICATION_IN_PROGRESS[year] = {'tiles_done': 0, 'tiles_total': n_rows * n_cols}
+
+        # Count cached vs download needed
+        cached_count = 0
+        download_count = 0
+
+        # Build spectral normalizers (quantile-map this year's data to 2019 reference)
+        print(f"  Building spectral normalizers for {year}...")
+        spectral_normalizers = build_spectral_normalizers(year)
+        if spectral_normalizers is not None:
+            print(f"  Normalization active: {year} -> 2019 reference distribution")
+        else:
+            print(f"  No normalization needed (reference year or no stats available)")
+
+        # Process tiles: row 0 = southernmost, col 0 = westernmost
+        for row in range(n_rows):
+            for col in range(n_cols):
+                # Tile center coordinates
+                center_lat = bounds['south'] + (row + 0.5) * step_lat
+                center_lon = bounds['west'] + (col + 0.5) * step_lon
+
+                tile_num = row * n_cols + col + 1
+                raw_tile_path = year_tile_dir / f"tile_{row:02d}_{col:02d}.npy"
+
+                try:
+                    # Check if raw satellite data is already cached
+                    if raw_tile_path.exists():
+                        bands_data = np.load(raw_tile_path)
+                        if not validate_tile(bands_data):
+                            print(f"  [{row},{col}] Tile {tile_num}/{n_rows*n_cols} CACHED but INVALID, re-downloading...")
+                            raw_tile_path.unlink()
+                        else:
+                            cached_count += 1
+                            if tile_num % 20 == 0 or tile_num == 1:
+                                print(f"  [{row},{col}] Tile {tile_num}/{n_rows*n_cols} CACHED")
+
+                    if not raw_tile_path.exists():
+                        # Download with retry
+                        max_retries = 3
+                        for attempt in range(max_retries):
+                            print(f"  [{row},{col}] Tile {tile_num}/{n_rows*n_cols} downloading{' (retry '+str(attempt)+')' if attempt > 0 else ''}...")
+                            image_data = download_imagery_for_year(center_lat, center_lon, year, size_km=tile_size_km)
+                            bands_data = image_data['bands_data']
+                            is_fallback = image_data.get('is_fallback', False)
+                            if not is_fallback and validate_tile(bands_data):
+                                np.save(raw_tile_path, bands_data)
+                                download_count += 1
+                                break
+                            else:
+                                reason = "fallback/training data" if is_fallback else "constant bands"
+                                print(f"    Invalid tile ({reason}), retrying in 5s...")
+                                import time
+                                time.sleep(5)  # Wait before retry
+                        else:
+                            print(f"    WARNING: Tile {tile_num} failed after {max_retries} retries, skipping")
+                            continue
+
+                    # Classify the tile (always re-run — this is fast)
+                    prediction = classify_image(bands_data, year=year, spectral_normalizers=spectral_normalizers)
+
+                    # Place in composite:
+                    # - row 0 (south) should be at BOTTOM of image (high y)
+                    # - col 0 (west) should be at LEFT of image (low x)
+                    y_start = (n_rows - 1 - row) * 256  # row 0 -> bottom
+                    x_start = col * 256
+
+                    composite[y_start:y_start+256, x_start:x_start+256] = prediction
+                    valid_tiles += 1
+                    CLASSIFICATION_IN_PROGRESS[year]['tiles_done'] = valid_tiles
+
+                except Exception as e:
+                    print(f"    Error: {e}")
+
+        # Clear in-progress flag now that we're done
+        CLASSIFICATION_IN_PROGRESS.pop(year, None)
+
+        print(f"  Tiles: {cached_count} cached, {download_count} downloaded")
+
+        # Apply ocean mask to the entire composite
+        print("  Applying ocean mask to separate inland water from ocean...")
+        composite = apply_ocean_mask_composite(composite, bounds)
+
+        # Recalculate statistics after ocean masking — LAND ONLY
+        # Exclude Clouds(0), Water(1), Ocean(7) from denominator
+        excluded_classes = {0, 1, 7}
+        land_pixels = sum(
+            np.sum(composite == cid)
+            for cid in CLASSES.keys()
+            if cid not in excluded_classes
+        )
+        if land_pixels == 0:
+            land_pixels = 1  # Avoid division by zero
+
+        total_statistics = {}
+        for class_id, class_info in CLASSES.items():
+            if class_id in excluded_classes:
+                continue
+            count = np.sum(composite == class_id)
+            if count > 0:
+                total_statistics[class_info['name']] = (count / land_pixels) * 100
+
+        # Create colored RGBA image
+        colored = np.zeros((composite_h, composite_w, 4), dtype=np.uint8)
+        for class_id, class_info in CLASSES.items():
+            mask = composite == class_id
+            colored[mask] = class_info['color'] + [255]
+
+        # Convert to PNG
+        img = Image.fromarray(colored, 'RGBA')
+        buffer = io.BytesIO()
+        img.save(buffer, format='PNG')
+        classification_b64 = base64.b64encode(buffer.getvalue()).decode()
+
+        # Format statistics
+        statistics = [
+            {'class': name, 'percentage': round(pct, 2)}
+            for name, pct in sorted(total_statistics.items(), key=lambda x: -x[1])
+        ]
+
+        # Save to cache
+        save_classification_to_cache(year, classification_b64, statistics)
+
+        print(f"Complete! {valid_tiles}/{n_rows*n_cols} tiles processed")
+        print(f"{'='*60}\n")
+
+        return jsonify({
+            'classification_image': classification_b64,
+            'bounds': bounds,
+            'statistics': statistics,
+            'year': year
+        })
+
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+# Background tile pre-download for cloud deployment (HuggingFace)
+import threading
+
+BACKGROUND_DOWNLOAD_STATUS = {}  # year -> {'tiles_done': int, 'tiles_total': int, 'done': bool}
+
+def background_download_tiles(year):
+    """Download all 195 tiles for a year in the background."""
+    try:
+        bounds = MAURITIUS_BOUNDS_FULL
+        n_rows, n_cols = 15, 13
+        km_per_deg_lat = 111.0
+        km_per_deg_lon = 111.0 * np.cos(np.radians(20.25))
+        lat_range = bounds['north'] - bounds['south']
+        lon_range = bounds['east'] - bounds['west']
+        step_lat = lat_range / n_rows
+        step_lon = lon_range / n_cols
+        tile_size_km = max(step_lat * km_per_deg_lat, step_lon * km_per_deg_lon)
+
+        year_tile_dir = RAW_TILES_CACHE_DIR / str(year)
+        year_tile_dir.mkdir(parents=True, exist_ok=True)
+
+        total = n_rows * n_cols
+        BACKGROUND_DOWNLOAD_STATUS[year] = {'tiles_done': 0, 'tiles_total': total, 'done': False}
+
+        cached = 0
+        downloaded = 0
+        for row in range(n_rows):
+            for col in range(n_cols):
+                tile_path = year_tile_dir / f"tile_{row:02d}_{col:02d}.npy"
+                tile_num = row * n_cols + col + 1
+
+                if tile_path.exists():
+                    cached += 1
+                    BACKGROUND_DOWNLOAD_STATUS[year]['tiles_done'] = cached + downloaded
+                    continue
+
+                center_lat = bounds['south'] + (row + 0.5) * step_lat
+                center_lon = bounds['west'] + (col + 0.5) * step_lon
+
+                for attempt in range(3):
+                    try:
+                        print(f"  [BG {year}] Tile {tile_num}/{total} downloading...")
+                        image_data = download_imagery_for_year(center_lat, center_lon, year, size_km=tile_size_km)
+                        bands_data = image_data['bands_data']
+                        if not image_data.get('is_fallback', False) and validate_tile(bands_data):
+                            np.save(tile_path, bands_data)
+                            downloaded += 1
+                            break
+                        else:
+                            import time
+                            time.sleep(5)
+                    except Exception as e:
+                        print(f"  [BG {year}] Tile {tile_num} error: {e}")
+                        import time
+                        time.sleep(10)
+
+                BACKGROUND_DOWNLOAD_STATUS[year]['tiles_done'] = cached + downloaded
+
+        BACKGROUND_DOWNLOAD_STATUS[year]['done'] = True
+        print(f"  [BG {year}] Complete! {cached} cached, {downloaded} downloaded")
+
+        # Now generate the full classification
+        print(f"  [BG {year}] Generating full classification...")
+        # Trigger classification via internal call
+        with app.test_request_context(json={'year': year}):
+            classify_mauritius()
+
+    except Exception as e:
+        print(f"  [BG {year}] Background download failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+@app.route('/api/background_status')
+def background_status():
+    """Return status of background tile downloads."""
+    return jsonify(BACKGROUND_DOWNLOAD_STATUS)
+
+
+def start_background_downloads():
+    """Start background tile downloads for default years."""
+    if not GEE_AVAILABLE:
+        print("GEE not available, skipping background downloads")
+        return
+
+    # Only auto-download on cloud (HuggingFace) where tiles aren't pre-cached
+    default_year = '2022'
+    year_tile_dir = RAW_TILES_CACHE_DIR / default_year
+    existing = list(year_tile_dir.glob('tile_*.npy')) if year_tile_dir.exists() else []
+
+    if len(existing) < 195:
+        print(f"\n[Background] Starting tile download for {default_year} ({len(existing)}/195 cached)")
+        t = threading.Thread(target=background_download_tiles, args=(default_year,), daemon=True)
+        t.start()
+    else:
+        print(f"\n[Background] All tiles cached for {default_year}")
+
+
+# Load model at module level (for gunicorn)
+print("=" * 60)
+print("Live Interactive Map - Mauritius Land Cover")
+print("=" * 60)
+load_model()
+print(f"\nUsing device: {DEVICE}")
+print(f"Google Earth Engine: {'Available' if GEE_AVAILABLE else 'Not available (using fallback)'}")
+
+# Start background downloads after model is loaded
+start_background_downloads()
+
+
+if __name__ == '__main__':
+    print("\n" + "=" * 60)
+    print("Starting web server...")
+    print("Visit: http://localhost:5003")
+    print("=" * 60)
+    print("\nHow to use:")
+    print("1. Pan around the map to explore different areas")
+    print("2. Click on any location to classify")
+    print("3. Imagery is fetched automatically as you move")
+    print("=" * 60 + "\n")
+
+    app.run(host='0.0.0.0', port=5003, debug=False, threaded=True)

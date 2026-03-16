@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Large data files (don't push to GitHub)
+data/training/tiles/*.npy
+data/live_imagery/
+*.tif
+*.tiff
+*.geotiff
+
+# Model checkpoints (only enhanced_model.pth tracked with Git LFS)
+checkpoints/best_model.pth
+checkpoints/improved_model.pth
+checkpoints/enhanced_model_backup_73pct.pth
+
+# Training logs
+training_log*.txt
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+*.env
+
+# Temporary files
+*.tmp
+*.temp
+.claude/
+data/classification_cache/raw_tiles/
+data/classification_cache/mauritius_*.png
+data/classification_cache/mauritius_*_stats.json
+data/training/tiles/*.png

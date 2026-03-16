@@ -1,0 +1,3 @@
+[console_scripts]
+landcover-train = models.train:main
+landcover-web = web.app:main

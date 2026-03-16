@@ -1,0 +1,13 @@
+{
+  "time_periods": [
+    "2022",
+    "2025"
+  ],
+  "statistics_by_year": {},
+  "bounds": {
+    "min_lon": 57.3,
+    "max_lon": 57.82,
+    "min_lat": -20.53,
+    "max_lat": -19.98
+  }
+}
