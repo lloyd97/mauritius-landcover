@@ -1198,7 +1198,7 @@ HTML_TEMPLATE = '''
 
         #container {
             display: grid;
-            grid-template-columns: 320px 1fr 1fr 280px 320px;
+            grid-template-columns: 250px 0.8fr 1fr 280px 380px;
             min-height: calc(100vh - 120px);
             gap: 0;
             overflow-x: auto;
@@ -1218,6 +1218,13 @@ HTML_TEMPLATE = '''
             font-weight: 600;
             margin-bottom: 10px;
             color: #333;
+        }
+
+        .mini-chart-box {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 6px;
+            border: 1px solid #e9ecef;
         }
 
         .historical-summary {
@@ -1445,13 +1452,13 @@ HTML_TEMPLATE = '''
         /* Responsive Design */
         @media (max-width: 1600px) {
             #container {
-                grid-template-columns: 250px 1fr 1fr 220px 280px;
+                grid-template-columns: 220px 0.8fr 1fr 220px 340px;
             }
         }
 
         @media (max-width: 1400px) {
             #container {
-                grid-template-columns: 220px 1fr 1fr 200px 250px;
+                grid-template-columns: 200px 0.8fr 1fr 200px 300px;
             }
 
             .panel-header {
@@ -1462,7 +1469,7 @@ HTML_TEMPLATE = '''
 
         @media (max-width: 1200px) {
             #container {
-                grid-template-columns: 180px 1fr 1fr 180px 220px;
+                grid-template-columns: 180px 0.8fr 1fr 180px 260px;
             }
 
             #header h1 {
@@ -1761,13 +1768,16 @@ HTML_TEMPLATE = '''
             <div class="panel-header">📈 Historical Change Detection</div>
             <div class="panel-content">
                 <div id="change-chart-container">
-                    <div class="chart-title">Land Cover Changes Over Time</div>
-                    <canvas id="changeChart"></canvas>
-                    <div id="historical-summary" class="historical-summary">
-                        <h4>Change Summary (2010 vs Current)</h4>
-                        <p style="color: #999; font-size: 11px;">Click "Load Historical Comparison" to analyze changes</p>
+                    <div style="margin-bottom: 8px;">
+                        <label style="font-size: 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;">
+                            <input type="checkbox" id="toggle-2016" checked style="cursor: pointer;">
+                            Include 2016 data
+                        </label>
                     </div>
-                    <button id="load-historical-btn" style="margin-top: 10px; padding: 8px 16px; background: #4a7c24; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; width: 100%;">
+                    <div id="historical-summary" class="historical-summary">
+                        <p style="color: #999; font-size: 11px;">Loading historical data...</p>
+                    </div>
+                    <button id="load-historical-btn" style="display:none; margin-top: 10px; padding: 8px 16px; background: #4a7c24; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; width: 100%;">
                         Load Historical Comparison
                     </button>
                 </div>
@@ -2051,133 +2061,82 @@ HTML_TEMPLATE = '''
             loadMauritiusClassification(selectedYear, true);
         });
 
-        // Load historical comparison button handler
-        document.getElementById('load-historical-btn').addEventListener('click', function() {
-            if (lastFetchedLat === null || lastFetchedLon === null) {
-                alert('Please select a location on the map first');
-                return;
-            }
-
-            const btn = this;
-            btn.textContent = 'Loading historical data...';
-            btn.disabled = true;
-
-            // Fetch historical comparison data
-            fetch('/api/historical_comparison', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    lat: lastFetchedLat,
-                    lon: lastFetchedLon,
-                    years: ['2010', '2016', '2019', '2022', '2025']
-                })
-            })
+        // Auto-load historical chart from cached full-island stats
+        function loadCachedHistoricalChart() {
+            fetch('/api/cached_historical_stats')
             .then(r => r.json())
             .then(data => {
-                if (data.error) {
-                    throw new Error(data.error);
+                if (data.error || !data.statistics || Object.keys(data.statistics).length === 0) {
+                    document.getElementById('load-historical-btn').style.display = 'block';
+                    return;
                 }
-
-                // Update chart with historical data
+                document.getElementById('load-historical-btn').style.display = 'none';
                 updateChangeChart(data);
-
-                // Update summary
                 updateHistoricalSummary(data);
-
-                btn.textContent = 'Refresh Historical Data';
-                btn.disabled = false;
             })
             .catch(err => {
-                console.error(err);
-                btn.textContent = 'Load Historical Comparison';
-                btn.disabled = false;
-                alert('Error loading historical data: ' + err.message);
-            });
-        });
-
-        // Update the change detection chart
-        function updateChangeChart(data) {
-            const ctx = document.getElementById('changeChart').getContext('2d');
-
-            if (changeChart) {
-                changeChart.destroy();
-            }
-
-            const years = Object.keys(data.statistics).sort();
-            const classes = ['Urban', 'Forest', 'Plantation', 'Water'];
-
-            const datasets = classes.map(className => ({
-                label: className,
-                data: years.map(year => {
-                    const yearStats = data.statistics[year];
-                    const classStat = yearStats.find(s => s.name === className);
-                    return classStat ? classStat.percentage : 0;
-                }),
-                backgroundColor: classColors[className],
-                borderColor: classColors[className].replace('0.8', '1'),
-                borderWidth: 2,
-                fill: false,
-                tension: 0.3
-            }));
-
-            changeChart = new Chart(ctx, {
-                type: 'line',
-                data: {
-                    labels: years.map(y => y === 'current' ? 'Current' : y),
-                    datasets: datasets
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: true,
-                    plugins: {
-                        legend: {
-                            position: 'bottom',
-                            labels: { font: { size: 10 } }
-                        }
-                    },
-                    scales: {
-                        y: {
-                            beginAtZero: true,
-                            max: 100,
-                            title: { display: true, text: '% Coverage', font: { size: 10 } }
-                        },
-                        x: {
-                            title: { display: true, text: 'Year', font: { size: 10 } }
-                        }
-                    }
-                }
+                console.error('Failed to load cached stats:', err);
+                document.getElementById('load-historical-btn').style.display = 'block';
             });
         }
 
-        // Update historical summary
+        // Load chart on page load
+        setTimeout(loadCachedHistoricalChart, 500);
+
+        // Store cached data for toggle re-render
+        let cachedHistoricalData = null;
+
+        function updateChangeChart(data) {
+            // No chart needed - table only
+        }
+
+        // Toggle 2016 handler
+        document.getElementById('toggle-2016').addEventListener('change', function() {
+            if (cachedHistoricalData) {
+                updateHistoricalSummary(cachedHistoricalData);
+            }
+        });
+
+        // Update historical summary as a table
         function updateHistoricalSummary(data) {
-            const years = Object.keys(data.statistics).sort();
+            cachedHistoricalData = data;
+            const include2016 = document.getElementById('toggle-2016').checked;
+            let years = Object.keys(data.statistics).sort();
+            if (!include2016) {
+                years = years.filter(y => y !== '2016');
+            }
             const firstYear = years[0];
             const lastYear = years[years.length - 1];
+            const classes = ['Plantation', 'Forest', 'Wasteland', 'Urban', 'Bare Land', 'Roads'];
 
-            const firstStats = data.statistics[firstYear];
-            const lastStats = data.statistics[lastYear];
+            let summaryHtml = `
+                <table style="width:100%; border-collapse:collapse; font-size:12px;">
+                    <thead>
+                        <tr style="border-bottom:2px solid #ddd;">
+                            <th style="text-align:left; padding:6px 4px;">Class</th>`;
+            years.forEach(y => {
+                summaryHtml += `<th style="text-align:center; padding:6px 4px;">${y}</th>`;
+            });
+            summaryHtml += `<th style="text-align:center; padding:6px 4px;">Change</th></tr></thead><tbody>`;
 
-            let summaryHtml = `<h4>Change: ${firstYear === 'current' ? 'Current' : firstYear} → ${lastYear === 'current' ? 'Current' : lastYear}</h4>`;
-
-            ['Urban', 'Forest', 'Plantation'].forEach(className => {
-                const first = firstStats.find(s => s.name === className);
-                const last = lastStats.find(s => s.name === className);
-
-                if (first && last) {
-                    const change = (last.percentage - first.percentage).toFixed(1);
-                    const changeClass = parseFloat(change) >= 0 ? 'change-positive' : 'change-negative';
-                    const arrow = parseFloat(change) >= 0 ? '↑' : '↓';
-
-                    summaryHtml += `
-                        <div class="change-indicator">
-                            <span>${className}</span>
-                            <span class="${changeClass}">${arrow} ${Math.abs(change)}%</span>
-                        </div>
-                    `;
-                }
+            classes.forEach(className => {
+                summaryHtml += `<tr style="border-bottom:1px solid #eee;"><td style="padding:5px 4px; font-weight:500;">${className}</td>`;
+                let firstVal = null, lastVal = null;
+                years.forEach(year => {
+                    const yearStats = data.statistics[year];
+                    const stat = yearStats.find(s => s.name === className || s.class === className);
+                    const val = stat ? stat.percentage : 0;
+                    if (firstVal === null) firstVal = val;
+                    lastVal = val;
+                    summaryHtml += `<td style="text-align:center; padding:5px 4px;">${val.toFixed(1)}%</td>`;
+                });
+                const change = ((lastVal - firstVal) / firstVal * 100).toFixed(1);
+                const color = parseFloat(change) >= 0 ? '#4CAF50' : '#f44336';
+                const arrow = parseFloat(change) >= 0 ? '↑' : '↓';
+                summaryHtml += `<td style="text-align:center; padding:5px 4px; color:${color}; font-weight:600;">${arrow}${Math.abs(change)}%</td></tr>`;
             });
 
+            summaryHtml += `</tbody></table>`;
             document.getElementById('historical-summary').innerHTML = summaryHtml;
         }
 
@@ -2303,6 +2262,22 @@ def historical_comparison():
         print(f"Error: {e}")
         import traceback
         traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/cached_historical_stats')
+def cached_historical_stats():
+    """Return cached full-island classification stats for all available years"""
+    try:
+        stats = {}
+        for year in ['2016', '2019', '2022', '2025']:
+            stats_path = CLASSIFICATION_CACHE_DIR / f'mauritius_{year}_stats.json'
+            if stats_path.exists():
+                with open(stats_path, 'r') as f:
+                    data = json.load(f)
+                stats[year] = data.get('statistics', [])
+        return jsonify({'statistics': stats})
+    except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 
