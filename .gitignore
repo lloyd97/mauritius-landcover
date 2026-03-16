@@ -48,3 +48,6 @@ Thumbs.db
 *.temp
 .claude/
 data/classification_cache/raw_tiles/
+data/classification_cache/mauritius_*.png
+data/classification_cache/mauritius_*_stats.json
+data/training/tiles/*.png
