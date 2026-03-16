@@ -1108,10 +1108,17 @@ HTML_TEMPLATE = '''
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
+        *::-webkit-scrollbar { display: none; }
+        * { -ms-overflow-style: none; scrollbar-width: none; }
+        html, body {
+            overflow: hidden;
+            height: 100vh;
+            width: 100%;
+        }
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            overflow-x: auto;
-            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
         }
 
         #header {
@@ -1198,15 +1205,16 @@ HTML_TEMPLATE = '''
 
         #container {
             display: grid;
-            grid-template-columns: 250px 0.8fr 0.8fr 280px 1fr;
-            min-height: calc(100vh - 120px);
+            grid-template-columns: minmax(200px, 300px) 1fr 1fr minmax(200px, 280px) minmax(250px, 1fr);
+            flex: 1;
+            min-height: 0;
             gap: 0;
-            overflow-x: auto;
+            overflow: hidden;
+            border-bottom: 3px solid #ffffff;
         }
 
         #change-chart-container {
             padding: 10px;
-            height: 100%;
         }
 
         #change-chart-container canvas {
@@ -1247,6 +1255,12 @@ HTML_TEMPLATE = '''
             border-bottom: 1px solid #eee;
         }
 
+        .smart-city-tooltip {
+            font-size: 12px;
+            line-height: 1.4;
+            padding: 6px 10px;
+        }
+
         .change-indicator:last-child {
             border-bottom: none;
         }
@@ -1264,16 +1278,12 @@ HTML_TEMPLATE = '''
             border-right: 1px solid #e0e0e0;
             display: flex;
             flex-direction: column;
-            min-width: 180px;
+            min-width: 0;
+            overflow: hidden;
         }
 
         .panel:last-child {
             border-right: none;
-        }
-
-        .panel:nth-child(2),
-        .panel:nth-child(3) {
-            min-width: 250px;
         }
 
         .panel-header {
@@ -1286,8 +1296,20 @@ HTML_TEMPLATE = '''
 
         .panel-content {
             flex: 1;
-            overflow: auto;
+            overflow-y: auto;
+            overflow-x: hidden;
             padding: 15px;
+            min-height: 0;
+        }
+
+        /* Hide scrollbar but keep scrollable */
+        .panel-content::-webkit-scrollbar {
+            width: 0;
+            display: none;
+        }
+        .panel-content {
+            -ms-overflow-style: none;
+            scrollbar-width: none;
         }
 
         #map {
@@ -1298,7 +1320,6 @@ HTML_TEMPLATE = '''
         #mauritius-map {
             height: 100%;
             width: 100%;
-            min-height: 200px;
             background-color: #a8d8ea;  /* Light blue for ocean */
         }
 
@@ -1340,8 +1361,14 @@ HTML_TEMPLATE = '''
         .image-container img {
             max-width: 100%;
             max-height: 100%;
+            object-fit: contain;
             border: 2px solid #e0e0e0;
             border-radius: 4px;
+        }
+
+        .image-container {
+            min-height: 0;
+            overflow: hidden;
         }
 
         .legend-item {
@@ -1452,13 +1479,13 @@ HTML_TEMPLATE = '''
         /* Responsive Design */
         @media (max-width: 1600px) {
             #container {
-                grid-template-columns: 220px 0.8fr 0.8fr 220px 1fr;
+                grid-template-columns: minmax(180px, 270px) 1fr 1fr minmax(180px, 220px) minmax(220px, 1fr);
             }
         }
 
         @media (max-width: 1400px) {
             #container {
-                grid-template-columns: 200px 0.8fr 0.8fr 200px 1fr;
+                grid-template-columns: minmax(170px, 250px) 1fr 1fr minmax(160px, 200px) minmax(200px, 1fr);
             }
 
             .panel-header {
@@ -1469,7 +1496,7 @@ HTML_TEMPLATE = '''
 
         @media (max-width: 1200px) {
             #container {
-                grid-template-columns: 180px 0.8fr 0.8fr 180px 1fr;
+                grid-template-columns: minmax(160px, 220px) 1fr 1fr minmax(140px, 180px) minmax(180px, 1fr);
             }
 
             #header h1 {
@@ -1505,8 +1532,8 @@ HTML_TEMPLATE = '''
             #container {
                 grid-template-columns: 1fr 1fr;
                 grid-template-rows: auto auto auto auto;
-                height: auto;
-                min-height: calc(100vh - 120px);
+                height: calc(100vh - 120px);
+                overflow: hidden;
             }
 
             .panel {
@@ -1517,25 +1544,21 @@ HTML_TEMPLATE = '''
             .panel:nth-child(1) { /* Satellite panel */
                 order: 3;
                 grid-column: 1;
-                min-height: 300px;
             }
 
             .panel:nth-child(2) { /* Map panel */
                 order: 1;
                 grid-column: 1 / -1;
-                min-height: 350px;
             }
 
             .panel:nth-child(3) { /* Mauritius Map panel */
                 order: 2;
                 grid-column: 1 / -1;
-                min-height: 300px;
             }
 
             .panel:nth-child(4) { /* Legend panel */
                 order: 4;
                 grid-column: 2;
-                min-height: 300px;
             }
 
             .panel:nth-child(5) { /* Historical panel */
@@ -1566,11 +1589,11 @@ HTML_TEMPLATE = '''
             }
 
             .panel:nth-child(2) {
-                min-height: 300px;
+                min-height: 0;
             }
 
             .panel:nth-child(3) {
-                min-height: 280px;
+                min-height: 0;
             }
 
             #header {
@@ -1658,11 +1681,11 @@ HTML_TEMPLATE = '''
             }
 
             .panel:nth-child(2) {
-                min-height: 250px;
+                min-height: 0;
             }
 
             .panel:nth-child(3) {
-                min-height: 220px;
+                min-height: 0;
             }
 
             #year-selector {
@@ -1744,7 +1767,7 @@ HTML_TEMPLATE = '''
 
         <div class="panel">
             <div class="panel-header">🗺️ Mauritius Classification</div>
-            <div class="panel-content" style="padding: 0; position: relative; height: calc(100% - 40px);">
+            <div class="panel-content" style="padding: 0; position: relative;">
                 <div id="mauritius-map"></div>
                 <div id="mauritius-loading" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); display: none; background: rgba(255,255,255,0.9); padding: 15px 25px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); z-index: 1000;">
                     <div style="display: flex; align-items: center; gap: 10px;">
@@ -1781,6 +1804,11 @@ HTML_TEMPLATE = '''
                             <input type="checkbox" id="toggle-ldn" checked style="cursor: pointer;">
                             Show LDN 2030 Target
                         </label>
+                        <hr style="margin: 4px 0; border: none; border-top: 1px solid #ddd;">
+                        <label style="font-size: 11px; cursor: pointer; display: inline-flex; align-items: center; gap: 5px;">
+                            <input type="checkbox" id="toggle-smartcities" style="cursor: pointer;">
+                            🏗️ Show Smart City Projects
+                        </label>
                     </div>
                     <div id="historical-summary" class="historical-summary">
                         <p style="color: #999; font-size: 11px;">Loading historical data...</p>
@@ -1795,7 +1823,7 @@ HTML_TEMPLATE = '''
 
     <script>
         // Initialize map centered on Mauritius
-        const map = L.map('map').setView([{{ center_lat }}, {{ center_lon }}], 11);
+        const map = L.map('map', { attributionControl: false }).setView([{{ center_lat }}, {{ center_lon }}], 11);
 
         // Add OpenStreetMap tiles
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -1837,6 +1865,61 @@ HTML_TEMPLATE = '''
 
         let mauritiusOverlay = null;
         let currentMauritiusYear = null;
+
+        // Smart City Projects overlay
+        const smartCities = [
+            // Under construction (purple) - partially built
+            { name: 'Moka (Telfair)', lat: -20.2278, lon: 57.5078, ha: 182, built: true, pctBuilt: '~45%' },
+            { name: 'Médine (Uniciti)', lat: -20.2789, lon: 57.4070, ha: 347, built: true, pctBuilt: '~18%' },
+            { name: 'Beau Plan', lat: -20.0980, lon: 57.5750, ha: 230, built: true, pctBuilt: '~22%' },
+            { name: 'Azuri', lat: -20.0969, lon: 57.6981, ha: 170, built: true, pctBuilt: '14%' },
+            { name: 'Cap Tamarin', lat: -20.3280, lon: 57.3780, ha: 44, built: true, pctBuilt: '~25%' },
+            { name: 'Mon Trésor', lat: -20.4350, lon: 57.6650, ha: 400, built: true, pctBuilt: '~15%' },
+            { name: 'Jin Fei (Riche Terre)', lat: -20.1380, lon: 57.5300, ha: 137, built: true, pctBuilt: '~12%' },
+            // Not yet built (red) - planned/early stage
+            { name: 'Curzon (Le Bouchon)', lat: -20.4683, lon: 57.6808, ha: 152, built: false, pctBuilt: '0%' },
+            { name: 'Anahita Beau Champ', lat: -20.2500, lon: 57.7800, ha: 118, built: false, pctBuilt: '~3%' },
+        ];
+
+        // Mauritius total land area in hectares
+        const TOTAL_LAND_HA = 185900;
+        let smartCityLayers = [];
+
+        function toggleSmartCities(show) {
+            if (show) {
+                smartCities.forEach(sc => {
+                    const radius = Math.sqrt(sc.ha * 10000 / Math.PI);
+                    const color = sc.built ? '#9C27B0' : '#D32F2F';
+                    const fillColor = sc.built ? '#CE93D8' : '#EF9A9A';
+                    const pctLand = (sc.ha / TOTAL_LAND_HA * 100).toFixed(2);
+
+                    const circle = L.circle([sc.lat, sc.lon], {
+                        radius: radius,
+                        color: color,
+                        weight: 3,
+                        fillColor: fillColor,
+                        fillOpacity: 0.7,
+                        dashArray: sc.built ? null : '6,4'
+                    }).addTo(mauritiusMap);
+
+                    circle.bindTooltip(
+                        `<b>${sc.name}</b><br>` +
+                        `${sc.ha} ha (${pctLand}% of island)<br>` +
+                        `<span style="color:${color}">${sc.built ? '🟣 Under construction' : '🔴 Planned'}</span>`,
+                        { sticky: true, className: 'smart-city-tooltip' }
+                    );
+
+                    smartCityLayers.push(circle);
+                });
+            } else {
+                smartCityLayers.forEach(layer => mauritiusMap.removeLayer(layer));
+                smartCityLayers = [];
+            }
+        }
+
+        document.getElementById('toggle-smartcities').addEventListener('change', function() {
+            toggleSmartCities(this.checked);
+        });
 
         // Function to load full island classification
         async function loadMauritiusClassification(year, force = false) {
@@ -2179,8 +2262,8 @@ HTML_TEMPLATE = '''
             years.forEach(y => {
                 summaryHtml += `<th style="text-align:center; padding:5px 3px;">${y}</th>`;
             });
-            if (show2030) summaryHtml += `<th style="text-align:center; padding:5px 3px; color:#1565C0; border-left:2px solid #1565C0;">2030*</th>`;
-            if (showLdn) summaryHtml += `<th style="text-align:center; padding:5px 3px; color:#E65100; border-left:2px solid #E65100;">LDN†</th>`;
+            if (show2030) summaryHtml += `<th style="text-align:center; padding:5px 3px; color:#1565C0; border-left:2px solid #1565C0;">2030</th>`;
+            if (showLdn) summaryHtml += `<th style="text-align:center; padding:5px 3px; color:#E65100; border-left:2px solid #E65100;">LDN</th>`;
             summaryHtml += `<th style="text-align:center; padding:5px 3px;">Change</th></tr></thead><tbody>`;
 
             classes.forEach(className => {
@@ -2209,8 +2292,8 @@ HTML_TEMPLATE = '''
             });
 
             summaryHtml += `</tbody></table>`;
-            if (show2030) summaryHtml += `<p style="font-size:10px; color:#999; margin-top:6px;">* 2030 predicted (linear regression from ${firstYear}-${lastYear})</p>`;
-            if (showLdn) summaryHtml += `<p style="font-size:10px; color:#999; margin-top:${show2030 ? '2' : '6'}px;">† LDN = Land Degradation Neutrality targets (Mauritius UNCCD 2030)</p>`;
+            if (show2030) summaryHtml += `<p style="font-size:10px; color:#999; margin-top:6px;">2030: predicted via linear regression (${firstYear}-${lastYear})</p>`;
+            if (showLdn) summaryHtml += `<p style="font-size:10px; color:#999; margin-top:${show2030 ? '2' : '6'}px;">LDN: Land Degradation Neutrality targets (Mauritius UNCCD 2030)</p>`;
             if (!show2030) summaryHtml += `<p style="font-size:10px; color:#999; margin-top:6px;">Change: ${firstYear} → ${lastYear}</p>`;
             document.getElementById('historical-summary').innerHTML = summaryHtml;
         }
@@ -2248,34 +2331,98 @@ def index():
 
 @app.route('/api/classify_location', methods=['POST'])
 def classify_location():
-    """Download and classify satellite imagery for location and year"""
+    """Classify satellite imagery for location using cached raw tiles (no GEE download).
+    Loads a 2x2 block of tiles around the click point, classifies each independently,
+    then stitches into a 512x512 image for display.
+    """
     try:
         data = request.get_json()
         lat = data.get('lat')
         lon = data.get('lon')
         year = data.get('year', 'current')
 
-        print(f"\n{'='*60}")
         print(f"Classifying location: {lat:.4f}, {lon:.4f} for year: {year}")
 
-        # Download imagery for the specified year
-        image_data = download_imagery_for_year(lat, lon, year)
+        bounds = MAURITIUS_BOUNDS_FULL
+        n_rows, n_cols = 15, 13
+        step_lat = (bounds['north'] - bounds['south']) / n_rows
+        step_lon = (bounds['east'] - bounds['west']) / n_cols
 
-        # Classify (pass year for correct NDVI thresholds)
-        prediction = classify_image(image_data['bands_data'], year=year)
+        # Find which tile the click falls in
+        row_f = (lat - bounds['south']) / step_lat
+        col_f = (lon - bounds['west']) / step_lon
+        center_row = int(row_f)
+        center_col = int(col_f)
+        center_row = max(0, min(n_rows - 1, center_row))
+        center_col = max(0, min(n_cols - 1, center_col))
 
-        # Create colored visualization
-        classification_colored = create_colored_mask(prediction)
+        # Determine 2x2 block: pick the tile containing the click + neighbors
+        # based on which quadrant of the tile the click is in
+        frac_row = row_f - center_row  # 0-1 within tile
+        frac_col = col_f - center_col
+        # If click is in upper half of tile, pair with tile above; else below
+        if frac_row >= 0.5 and center_row < n_rows - 1:
+            row_lo, row_hi = center_row, center_row + 1
+        else:
+            row_lo, row_hi = max(0, center_row - 1), center_row
+        # If click is in right half, pair with tile to the right; else left
+        if frac_col >= 0.5 and center_col < n_cols - 1:
+            col_lo, col_hi = center_col, center_col + 1
+        else:
+            col_lo, col_hi = max(0, center_col - 1), center_col
 
-        # Get statistics
-        statistics = get_class_statistics(prediction)
+        year_tile_dir = RAW_TILES_CACHE_DIR / str(year)
+        tile_size = 256
+        has_tiles = year_tile_dir.exists()
 
-        # Convert to base64
-        satellite_b64 = array_to_base64(image_data['rgb_image'])
-        classification_b64 = array_to_base64(classification_colored)
+        if has_tiles:
+            spectral_normalizers = build_spectral_normalizers(year)
 
-        print(f"Classification complete for {year}!")
-        print(f"{'='*60}\n")
+            # Load and classify each tile in the 2x2 block
+            rgb_grid = np.zeros((tile_size * 2, tile_size * 2, 3), dtype=np.uint8)
+            cls_grid = np.zeros((tile_size * 2, tile_size * 2, 3), dtype=np.uint8)
+            pred_grid = np.zeros((tile_size * 2, tile_size * 2), dtype=np.uint8)
+            tiles_loaded = 0
+
+            for gi, r in enumerate([row_hi, row_lo]):  # top=north(hi), bottom=south(lo)
+                for gj, c in enumerate([col_lo, col_hi]):  # left=west(lo), right=east(hi)
+                    tile_path = year_tile_dir / f"tile_{r:02d}_{c:02d}.npy"
+                    y0 = gi * tile_size
+                    x0 = gj * tile_size
+
+                    if tile_path.exists():
+                        bands_data = np.load(tile_path)
+                        tiles_loaded += 1
+
+                        # RGB
+                        rgb = np.stack([bands_data[2], bands_data[1], bands_data[0]], axis=-1)
+                        rgb = np.clip(rgb / 3000 * 255, 0, 255).astype(np.uint8)
+                        rgb_grid[y0:y0+tile_size, x0:x0+tile_size] = rgb
+
+                        # Classify
+                        prediction = classify_image(bands_data, year=year, spectral_normalizers=spectral_normalizers)
+                        cls_colored = create_colored_mask(prediction)
+                        cls_grid[y0:y0+tile_size, x0:x0+tile_size] = cls_colored
+                        pred_grid[y0:y0+tile_size, x0:x0+tile_size] = prediction
+
+            print(f"  Loaded {tiles_loaded}/4 tiles: rows [{row_lo},{row_hi}] cols [{col_lo},{col_hi}]")
+
+            statistics = get_class_statistics(pred_grid)
+            satellite_b64 = array_to_base64(rgb_grid)
+            classification_b64 = array_to_base64(cls_grid)
+        else:
+            # No cached tiles — fall back to GEE download
+            print(f"  No cached tiles, downloading from GEE...")
+            image_data = download_imagery_for_year(lat, lon, year)
+            bands_data = image_data['bands_data']
+            spectral_normalizers = build_spectral_normalizers(year)
+            prediction = classify_image(bands_data, year=year, spectral_normalizers=spectral_normalizers)
+            classification_colored = create_colored_mask(prediction)
+            statistics = get_class_statistics(prediction)
+            satellite_b64 = array_to_base64(image_data['rgb_image'])
+            classification_b64 = array_to_base64(classification_colored)
+
+        print(f"  Classification complete (cached tiles)")
 
         return jsonify({
             'satellite': satellite_b64,
