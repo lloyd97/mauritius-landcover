@@ -2503,8 +2503,13 @@ def cached_historical_stats():
         return jsonify({'error': str(e)}), 500
 
 
-# Directory for cached full-island classification images
-CLASSIFICATION_CACHE_DIR = Path('data/classification_cache')
+# On HuggingFace Spaces, use persistent storage (/data) so tiles survive restarts
+IS_HF_SPACE = os.environ.get('SPACE_ID') is not None
+if IS_HF_SPACE:
+    CLASSIFICATION_CACHE_DIR = Path('/data/classification_cache')
+    print(f"HuggingFace Space detected — using persistent storage: {CLASSIFICATION_CACHE_DIR}")
+else:
+    CLASSIFICATION_CACHE_DIR = Path('data/classification_cache')
 CLASSIFICATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Directory for cached raw satellite tile data (never re-downloaded)
@@ -2726,10 +2731,59 @@ def classify_mauritius():
                 except Exception as e:
                     print(f"    Error: {e}")
 
+        print(f"  Tiles: {cached_count} cached, {download_count} downloaded")
+
+        # --- Retry pass: re-download any missing/failed tiles ---
+        failed_tiles = []
+        for row in range(n_rows):
+            for col in range(n_cols):
+                raw_tile_path = year_tile_dir / f"tile_{row:02d}_{col:02d}.npy"
+                y_start = (n_rows - 1 - row) * 256
+                x_start = col * 256
+                tile_region = composite[y_start:y_start+256, x_start:x_start+256]
+                # A tile is "failed" if it has no cached file AND its region is all zeros
+                if not raw_tile_path.exists() and np.all(tile_region == 0):
+                    failed_tiles.append((row, col))
+
+        if failed_tiles and GEE_AVAILABLE:
+            print(f"\n  Retry pass: {len(failed_tiles)} tiles failed, re-attempting with 30s delays...")
+            import time
+            retry_success = 0
+            for row, col in failed_tiles:
+                tile_num = row * n_cols + col + 1
+                raw_tile_path = year_tile_dir / f"tile_{row:02d}_{col:02d}.npy"
+                center_lat = bounds['south'] + (row + 0.5) * step_lat
+                center_lon = bounds['west'] + (col + 0.5) * step_lon
+
+                for attempt in range(3):
+                    try:
+                        time.sleep(30)  # Longer delay to let GEE recover
+                        print(f"  [{row},{col}] Tile {tile_num}/{n_rows*n_cols} retry {attempt+1}/3...")
+                        image_data = download_imagery_for_year(center_lat, center_lon, year, size_km=tile_size_km)
+                        bands_data = image_data['bands_data']
+                        is_fallback = image_data.get('is_fallback', False)
+                        if not is_fallback and validate_tile(bands_data):
+                            np.save(raw_tile_path, bands_data)
+                            # Classify and place in composite
+                            prediction = classify_image(bands_data, year=year, spectral_normalizers=spectral_normalizers)
+                            y_start = (n_rows - 1 - row) * 256
+                            x_start = col * 256
+                            composite[y_start:y_start+256, x_start:x_start+256] = prediction
+                            valid_tiles += 1
+                            retry_success += 1
+                            print(f"    Retry SUCCESS for tile [{row},{col}]")
+                            break
+                        else:
+                            reason = "fallback/training data" if is_fallback else "constant bands"
+                            print(f"    Retry invalid ({reason})")
+                    except Exception as e:
+                        print(f"    Retry error: {e}")
+                        time.sleep(10)
+
+            print(f"  Retry pass complete: {retry_success}/{len(failed_tiles)} recovered")
+
         # Clear in-progress flag now that we're done
         CLASSIFICATION_IN_PROGRESS.pop(year, None)
-
-        print(f"  Tiles: {cached_count} cached, {download_count} downloaded")
 
         # Apply ocean mask to the entire composite
         print("  Applying ocean mask to separate inland water from ocean...")
@@ -2772,10 +2826,18 @@ def classify_mauritius():
             for name, pct in sorted(total_statistics.items(), key=lambda x: -x[1])
         ]
 
-        # Save to cache
-        save_classification_to_cache(year, classification_b64, statistics)
-
-        print(f"Complete! {valid_tiles}/{n_rows*n_cols} tiles processed")
+        # Only cache if all tiles were processed (no missing gaps)
+        expected_tiles = n_rows * n_cols
+        missing_tiles = expected_tiles - valid_tiles
+        # Count how many tiles are pure ocean (these don't need raw files)
+        ocean_tiles = sum(1 for row in range(n_rows) for col in range(n_cols)
+                         if not (year_tile_dir / f"tile_{row:02d}_{col:02d}.npy").exists())
+        actual_missing = missing_tiles - ocean_tiles
+        if actual_missing <= 0:
+            save_classification_to_cache(year, classification_b64, statistics)
+            print(f"Complete! {valid_tiles}/{expected_tiles} tiles processed - CACHED")
+        else:
+            print(f"Complete! {valid_tiles}/{expected_tiles} tiles processed - NOT CACHED ({actual_missing} land tiles missing, will retry next request)")
         print(f"{'='*60}\n")
 
         return jsonify({
@@ -2848,6 +2910,40 @@ def background_download_tiles(year):
                         import time
                         time.sleep(10)
 
+                BACKGROUND_DOWNLOAD_STATUS[year]['tiles_done'] = cached + downloaded
+
+        # Retry pass for any tiles that failed all attempts
+        missing = []
+        for row in range(n_rows):
+            for col in range(n_cols):
+                tile_path = year_tile_dir / f"tile_{row:02d}_{col:02d}.npy"
+                if not tile_path.exists():
+                    missing.append((row, col))
+
+        if missing:
+            print(f"  [BG {year}] Retry pass: {len(missing)} tiles still missing, retrying with 30s delays...")
+            import time
+            for row, col in missing:
+                tile_path = year_tile_dir / f"tile_{row:02d}_{col:02d}.npy"
+                tile_num = row * n_cols + col + 1
+                center_lat = bounds['south'] + (row + 0.5) * step_lat
+                center_lon = bounds['west'] + (col + 0.5) * step_lon
+                for attempt in range(3):
+                    try:
+                        time.sleep(30)
+                        print(f"  [BG {year}] Retry tile {tile_num}/{total} attempt {attempt+1}/3...")
+                        image_data = download_imagery_for_year(center_lat, center_lon, year, size_km=tile_size_km)
+                        bands_data = image_data['bands_data']
+                        if not image_data.get('is_fallback', False) and validate_tile(bands_data):
+                            np.save(tile_path, bands_data)
+                            downloaded += 1
+                            print(f"  [BG {year}] Retry SUCCESS for tile [{row},{col}]")
+                            break
+                        else:
+                            print(f"  [BG {year}] Retry invalid for tile [{row},{col}]")
+                    except Exception as e:
+                        print(f"  [BG {year}] Retry error tile [{row},{col}]: {e}")
+                        time.sleep(10)
                 BACKGROUND_DOWNLOAD_STATUS[year]['tiles_done'] = cached + downloaded
 
         BACKGROUND_DOWNLOAD_STATUS[year]['done'] = True
