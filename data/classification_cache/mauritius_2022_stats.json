@@ -1,1 +1,3 @@
-{"statistics": [{"class": "Plantation", "percentage": 45.11}, {"class": "Forest", "percentage": 26.9}, {"class": "Wasteland", "percentage": 13.54}, {"class": "Urban", "percentage": 12.61}, {"class": "Bare Land", "percentage": 1.39}, {"class": "Roads", "percentage": 0.44}], "year": "2022"}
+version https://git-lfs.github.com/spec/v1
+oid sha256:f383302ea91ec3aa5eed69207a8f0359df5bda45429e7e0a8557052a82dd6820
+size 289

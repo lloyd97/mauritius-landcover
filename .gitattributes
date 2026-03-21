@@ -1,1 +1,5 @@
 checkpoints/*.pth filter=lfs diff=lfs merge=lfs -text
+data/classification_cache/*.png filter=lfs diff=lfs merge=lfs -text
+data/classification_cache/*.json filter=lfs diff=lfs merge=lfs -text
+data/historical_analysis/*.npy filter=lfs diff=lfs merge=lfs -text
+data/historical_analysis/*.png filter=lfs diff=lfs merge=lfs -text
