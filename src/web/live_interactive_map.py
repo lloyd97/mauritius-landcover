@@ -2503,17 +2503,17 @@ def cached_historical_stats():
         return jsonify({'error': str(e)}), 500
 
 
-# On HuggingFace Spaces, use persistent storage (/data) so tiles survive restarts
-IS_HF_SPACE = os.environ.get('SPACE_ID') is not None
-if IS_HF_SPACE:
-    CLASSIFICATION_CACHE_DIR = Path('/data/classification_cache')
-    print(f"HuggingFace Space detected — using persistent storage: {CLASSIFICATION_CACHE_DIR}")
-else:
-    CLASSIFICATION_CACHE_DIR = Path('data/classification_cache')
+# Classification cache: always use repo path (committed PNGs live here)
+CLASSIFICATION_CACHE_DIR = Path('data/classification_cache')
 CLASSIFICATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Directory for cached raw satellite tile data (never re-downloaded)
-RAW_TILES_CACHE_DIR = CLASSIFICATION_CACHE_DIR / 'raw_tiles'
+# On HuggingFace Spaces, use /data for raw tiles if persistent storage is available
+IS_HF_SPACE = os.environ.get('SPACE_ID') is not None
+if IS_HF_SPACE and Path('/data').exists():
+    RAW_TILES_CACHE_DIR = Path('/data/raw_tiles')
+    print(f"HuggingFace Space detected — using persistent storage for raw tiles: {RAW_TILES_CACHE_DIR}")
+else:
+    RAW_TILES_CACHE_DIR = CLASSIFICATION_CACHE_DIR / 'raw_tiles'
 RAW_TILES_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Mauritius bounding box (constant)
